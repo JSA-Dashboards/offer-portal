@@ -1,0 +1,7 @@
+# The Droplet only runs the scrapers (scrape_run.py), so it skips Streamlit/pandas/pytest — the box has
+# 2 GB RAM shared with a dozen other jobs. Keep in step with requirements.txt for these packages.
+requests
+beautifulsoup4
+snowflake-connector-python>=3.7
+cryptography
+python-dotenv
