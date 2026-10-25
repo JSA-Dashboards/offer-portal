@@ -35,7 +35,7 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 
 ## Run
 ```
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt is the runtime set Streamlit Cloud installs
 python -m pytest -q tests
 streamlit run app.py        # needs SNOWFLAKE_* (key-pair auth) in .env or Streamlit secrets
 ```

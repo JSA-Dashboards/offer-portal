@@ -3,6 +3,9 @@ pandas>=2.0
 snowflake-connector-python>=3.7
 cryptography
 python-dotenv
-pytest
 requests
 beautifulsoup4
+# Microsoft Graph sign-in emails (portal/auth.py send_via_graph)
+msal
+# zoneinfo needs the tz database on hosts that don't ship one
+tzdata
