@@ -1,7 +1,9 @@
 """Offer Portal — white-label grain offer manager. One app; the tenant comes from ?t=<slug>.
 
-Elevator staff manage the bid board (and confirm scraped bids); farmers see their
-elevator's published bids. Offers screens are the next build step.
+Access by role (same portal, more or less in it): JSA platform admin (everything, every tenant) >
+elevator admin (bids, scraped bids, hedging, auto-hit, people, everything staff do) >
+elevator staff (offers, purchases, farmers; the bid board is read-only) >
+farmer (the bid board read-only, their own offers, delayed futures, the USDA calendar).
 """
 from __future__ import annotations
 
@@ -22,7 +24,7 @@ except Exception:
     pass
 
 import scrape_run
-from portal import auth, contracts, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
+from portal import auth, contracts, usda_calendar, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
 from portal.db import connect
 
 GRAINS = contracts.GRAINS
@@ -490,9 +492,25 @@ STAGES = {"Outstanding": ("submitted",), "Hit": ("hit",), "Acknowledged": ("ackn
 
 
 @st.fragment
+def calendar_view() -> None:
+    st.subheader("USDA report calendar")
+    st.caption("Times are Central. Weekly reports can move a day in holiday weeks; always confirm on usda.gov.")
+    days = st.segmented_control("Look ahead", [14, 30, 60], default=30, format_func=lambda d: f"{d} days",
+                                key="cal_days") or 30
+    rows = usda_calendar.upcoming(data.today_ct(), days)
+    if not rows:
+        st.info("No reports in this window.")
+        return
+    st.dataframe([{"Date": f"{r['weekday']} {r['date']:%b %d}", "Time (CT)": r["time"], "Report": r["report"],
+                   "What it covers": r["note"]} for r in rows], hide_index=True, width="stretch")
+
+
 def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
     data.expire_stale(db, tenant_id)
     rows = data.list_offers(db, tenant_id, user)
+    if staff and st.toggle("Only offers I placed", False, key="offers_mine",
+                           help="Offers you entered on a farmer's behalf. Off shows the whole company's."):
+        rows = [o for o in rows if o["placed_by"] == user["user_id"]]
     counts = {k: sum(1 for o in rows if o["status"] in v) for k, v in STAGES.items()}
     stage = st.radio("Stage", list(STAGES), horizontal=True, label_visibility="collapsed",
                      format_func=lambda k: f"{k} ({counts[k]})", key="offers_stage")
@@ -1162,8 +1180,9 @@ def main() -> None:
     tid = tenant["tenant_id"]
     admin = user["role"] in ("elevator_admin", "platform_admin")
     views = (["Offers", "Summary"] + (["Hedge", "Auto-hit"] if admin else []) +
-             ["Purchases", "Recap", "Place offer", "Farmers", "Bid board", "Review scraped bids", "People"] if staff
-             else ["Bid board", "Make an offer", "My offers"])
+             ["Purchases", "Recap", "Place offer", "Farmers", "Bid board"] + (["Review scraped bids"] if admin else []) +
+             ["USDA calendar", "People"] if staff
+             else ["Bid board", "Make an offer", "My offers", "USDA calendar"])
     if user["role"] == "platform_admin":
         views = views + ["Platform"]
     view = st.radio("View", views, horizontal=True, label_visibility="collapsed")
@@ -1187,8 +1206,10 @@ def main() -> None:
         farmers_view(db, tenant, user)
     elif view == "Review scraped bids":
         suggestions_view(db, tid, user)
+    elif view == "USDA calendar":
+        calendar_view()
     elif view == "Bid board":
-        published_view(db, tid, user, editable=staff, tenant=tenant)
+        published_view(db, tid, user, editable=admin, tenant=tenant)
     elif view == "Make an offer":
         offer_form_view(db, tenant, user)
     else:

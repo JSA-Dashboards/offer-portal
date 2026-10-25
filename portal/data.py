@@ -179,7 +179,8 @@ def list_bids(db: Db, tenant_id: str, grain: str | None = None) -> list[dict]:
 
 
 def _require_staff(db: Db, tenant_id: str, actor_id: int) -> None:
-    """Bid-board writes: elevator staff of this tenant, or a JSA platform admin."""
+    """Elevator staff of this tenant (admins included), or a JSA platform admin: offers, purchases, farmers.
+    Changing the bid board itself (publish, retire, review scraped bids) is _require_admin."""
     r = db.query("SELECT tenant_id, role FROM users WHERE user_id = %s AND active", (actor_id,))
     ok = r and (r[0]["role"] == "platform_admin"
                 or (r[0]["tenant_id"] == tenant_id and r[0]["role"] in ELEVATOR_ROLES))
@@ -188,7 +189,7 @@ def _require_staff(db: Db, tenant_id: str, actor_id: int) -> None:
 
 
 def retire_bid(db: Db, tenant_id: str, actor_id: int, bid_id: int) -> None:
-    _require_staff(db, tenant_id, actor_id)
+    _require_admin(db, tenant_id, actor_id)
     db.execute("UPDATE bids SET active = FALSE WHERE bid_id = %s AND tenant_id = %s", (bid_id, tenant_id))
     _audit(db, tenant_id, actor_id, "bid_retired", dict(bid_id=bid_id))
 
@@ -208,7 +209,7 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
     """Publish a bid. It replaces the live bid for the same slot (location, grain, delivery month,
     futures month). Returns a PublishResult: how many outstanding flat-price offers had their implied
     futures re-computed because the basis moved, and (.auto_hit) how many offers it then hit."""
-    _require_staff(db, tenant_id, actor_id)
+    _require_admin(db, tenant_id, actor_id)
     grain = contracts.canon_grain(grain)
     futures_symbol = _futures_month(grain, futures_symbol)
     if basis_cents is None and cash_price is None:
@@ -307,7 +308,7 @@ def review_suggestion(db: Db, tenant_id: str, actor_id: int, suggestion_id: int,
                       **overrides) -> int:
     """Approve (optionally with edited basis/price) -> publishes a bid; or discard.
     Returns how many outstanding flat-price offers the approved basis re-priced (0 for a discard)."""
-    _require_staff(db, tenant_id, actor_id)
+    _require_admin(db, tenant_id, actor_id)
     r = db.query("SELECT * FROM bid_suggestions WHERE suggestion_id = %s AND tenant_id = %s "
                  "AND status = 'suggested'", (suggestion_id, tenant_id))
     if not r:

@@ -43,7 +43,7 @@ DISCLAIMER = (
 
 # Shown wherever a futures price appears, and in the footer of any page that shows one.
 DELAYED_NOTICE = (
-    "Futures prices, and the flat bids calculated from them, are based on delayed quotes. They are not real-time, "
+    "Futures prices, and the flat bids calculated from them, are based on quotes delayed at least 10 minutes. They are not real-time, "
     "may differ from the market, and are shown for reference only. A flat bid is the futures price plus the posted "
     "basis, so it moves with futures; the basis stays as posted until an elevator administrator updates and "
     "confirms it.")

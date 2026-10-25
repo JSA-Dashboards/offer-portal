@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     from_name      STRING,                          -- email "from" display name
     hedging_enabled BOOLEAN     NOT NULL DEFAULT FALSE,   -- phase 2 flag
     open_pricing   BOOLEAN      NOT NULL DEFAULT TRUE,    -- farmers may propose any price
-    show_futures   BOOLEAN      DEFAULT FALSE,            -- farmers may see delayed futures quotes (staff always can)
+    show_futures   BOOLEAN      DEFAULT TRUE,             -- farmers see delayed futures quotes unless an elevator turns it off (staff always can)
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (tenant_id)
 );
