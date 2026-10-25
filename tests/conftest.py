@@ -8,6 +8,8 @@ CREATE TABLE login_codes (email TEXT, code_hash TEXT, expires_at TEXT, used INT 
 CREATE TABLE auto_hit_rules (rule_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT,
   grain TEXT, contract_type TEXT, max_bushels INT, active INT DEFAULT 1, created_by INT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE futures_quotes (symbol TEXT PRIMARY KEY, price REAL, as_of TEXT,
+  fetched_at TEXT DEFAULT CURRENT_TIMESTAMP, source TEXT DEFAULT 'massive', delayed INT DEFAULT 1);
 CREATE TABLE scrape_sources (source_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, url TEXT,
   location_name TEXT, active INT DEFAULT 1, last_run_at TEXT, last_status TEXT);
 CREATE TABLE farmers (farmer_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, client_id TEXT, entity_name TEXT,
@@ -17,7 +19,7 @@ CREATE TABLE invites (token_hash TEXT PRIMARY KEY, tenant_id TEXT, email TEXT, r
   invited_by INT, farmer_id INT, expires_at TEXT, used INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE tenants (tenant_id TEXT PRIMARY KEY, name TEXT, status TEXT DEFAULT 'active', logo_url TEXT,
   primary_color TEXT, accent_color TEXT, support_email TEXT, from_name TEXT,
-  hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+  hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, show_futures INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE locations (location_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, state TEXT, active INT DEFAULT 1);
 CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT);
 CREATE TABLE bid_suggestions (suggestion_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, grain TEXT,

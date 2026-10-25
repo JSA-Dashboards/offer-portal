@@ -272,3 +272,22 @@ def test_outstanding_offers_of_every_type_follow_a_replaced_bid(db):
     o = _offers(db)
     assert new != first and o[flat]["bid_id"] == new and o[hta]["bid_id"] == new   # still priced off a live bid
     assert o[hit]["bid_id"] == first                                                 # a hit offer keeps the bid it was hit on
+
+
+# ── ids are assigned by the app, never read back with MAX(id) (Snowflake IDENTITY is not monotonic) ──
+def test_new_ids_are_unique_and_follow_creation_order():
+    ids = [data.new_id() for _ in range(2000)]
+    assert len(set(ids)) == len(ids)
+    import time
+    first = data.new_id()
+    time.sleep(0.01)
+    assert data.new_id() > first                                   # later ms -> larger id, so ORDER BY id is chronological
+
+
+def test_every_returned_id_is_the_row_that_was_just_written(db):
+    ids = [data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "bushels": 1000 + i}) for i in range(25)]
+    assert len(set(ids)) == 25
+    got = {o["offer_id"]: o["bushels"] for o in data.list_offers(db, "rcm", user(db, 2))}
+    assert [got[oid] for oid in ids] == [1000 + i for i in range(25)]      # each id points at its own offer
+    ev = {r["offer_id"] for r in db.query("SELECT offer_id FROM offer_events WHERE event_type = 'submitted'")}
+    assert set(ids) <= ev

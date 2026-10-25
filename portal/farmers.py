@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from .data import PortalError, _audit, _insert, _require_staff
+from .data import PortalError, _audit, _insert, _require_staff, new_id
 from .db import Db
 
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -57,9 +57,8 @@ def create_farmer(db: Db, tenant_id: str, staff_id: int, individual_name: str = 
                    "AND COALESCE(phone, '') = %s", (tenant_id, c["name"].lower(), c["phone"] or ""))
     if dup:
         raise PortalError("A farmer with that name and phone already exists.")
-    _insert(db, "farmers", dict(tenant_id=tenant_id, created_by=staff_id, **c))
-    fid = db.query("SELECT MAX(farmer_id) AS fid FROM farmers WHERE tenant_id = %s AND created_by = %s",
-                   (tenant_id, staff_id))[0]["fid"]
+    fid = new_id()
+    _insert(db, "farmers", dict(farmer_id=fid, tenant_id=tenant_id, created_by=staff_id, **c))
     _audit(db, tenant_id, staff_id, "farmer_created", dict(farmer_id=fid, name=c["name"], client_id=c["client_id"]))
     return fid
 

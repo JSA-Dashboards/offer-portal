@@ -70,7 +70,11 @@ def connect() -> Db:
               warehouse=os.environ.get("SNOWFLAKE_WAREHOUSE") or None,
               database=os.environ.get("SNOWFLAKE_DATABASE") or "OFFER_PORTAL",
               schema=os.environ.get("SNOWFLAKE_SCHEMA") or "OFFER_PORTAL",
-              login_timeout=30, network_timeout=30)
+              login_timeout=30, network_timeout=30,
+              # The app writes UTC timestamp strings (code / invite expiry, offer expiry). Snowflake reads a
+              # tz-less string in the SESSION time zone (default America/Los_Angeles), which would shift every
+              # expiry by hours. Pin the session to UTC so a string means what we wrote.
+              session_parameters={"TIMEZONE": "UTC"})
     pkey = _private_key_der()
     if pkey is None:
         raise RuntimeError("Set SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY (key-pair auth).")

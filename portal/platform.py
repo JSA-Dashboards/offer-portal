@@ -74,7 +74,7 @@ def create_tenant(db: Db, actor_id: int, slug: str, name: str, first_admin_email
 
 def update_tenant(db: Db, actor_id: int, tenant_id: str, *, name: str, logo_url: str | None,
                   primary_color: str, accent_color: str, support_email: str | None,
-                  from_name: str | None, open_pricing: bool, hedging_enabled: bool) -> None:
+                  from_name: str | None, open_pricing: bool, hedging_enabled: bool, show_futures: bool = False) -> None:
     _admin(db, actor_id)
     _tenant(db, tenant_id)
     if not name.strip():
@@ -86,12 +86,13 @@ def update_tenant(db: Db, actor_id: int, tenant_id: str, *, name: str, logo_url:
     if email and not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
         raise PortalError("Support email isn't valid.")
     db.execute("UPDATE tenants SET name = %s, logo_url = %s, primary_color = %s, accent_color = %s, "
-               "support_email = %s, from_name = %s, open_pricing = %s, hedging_enabled = %s "
+               "support_email = %s, from_name = %s, open_pricing = %s, hedging_enabled = %s, show_futures = %s "
                "WHERE tenant_id = %s",
                (name.strip(), logo, primary_color, accent_color, email, (from_name or "").strip() or None,
-                open_pricing, hedging_enabled, tenant_id))
+                open_pricing, hedging_enabled, show_futures, tenant_id))
     _audit(db, tenant_id, actor_id, "tenant_updated", dict(open_pricing=open_pricing,
-                                                           hedging_enabled=hedging_enabled))
+                                                           hedging_enabled=hedging_enabled,
+                                                           show_futures=show_futures))
 
 
 def set_tenant_status(db: Db, actor_id: int, tenant_id: str, active: bool) -> None:

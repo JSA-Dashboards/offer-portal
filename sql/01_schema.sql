@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     from_name      STRING,                          -- email "from" display name
     hedging_enabled BOOLEAN     NOT NULL DEFAULT FALSE,   -- phase 2 flag
     open_pricing   BOOLEAN      NOT NULL DEFAULT TRUE,    -- farmers may propose any price
+    show_futures   BOOLEAN      DEFAULT FALSE,            -- farmers may see delayed futures quotes (staff always can)
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (tenant_id)
 );
@@ -234,6 +235,19 @@ CREATE TABLE IF NOT EXISTS confirmations (
     hedge_ticket_id NUMBER(38,0),
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (confirmation_id)
+);
+
+-- ── Delayed futures quotes (market data, not tenant-owned): the latest per futures month ───────────────
+-- Filled by futures_run.py from the Massive API. A quote never changes a posted bid; it can only stage a
+-- suggestion that an elevator admin confirms (see portal/futures.py).
+CREATE TABLE IF NOT EXISTS futures_quotes (
+    symbol         STRING       NOT NULL,           -- e.g. ZCZ26
+    price          FLOAT        NOT NULL,           -- $/bu
+    as_of          TIMESTAMP_TZ,                    -- time of the last trade the quote is based on
+    fetched_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    source         STRING       NOT NULL DEFAULT 'massive',
+    delayed        BOOLEAN      NOT NULL DEFAULT TRUE,
+    PRIMARY KEY (symbol)
 );
 
 -- ── Admin audit + per-tenant billing usage ──────────────────────────────────

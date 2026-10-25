@@ -42,7 +42,7 @@ def test_unknown_tenant(app_db):
 def test_login_page_for_tenant(app_db):
     at = run(t="rcm")
     assert not at.exception
-    assert at.title[0].value == "RCM Coop"
+    assert any("RCM Coop" in m.value and "dash-header" in m.value for m in at.markdown)      # branded header
     assert at.text_input[0].label == "Email"
 
 

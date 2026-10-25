@@ -7,6 +7,9 @@ platform users) are at the bottom and are for platform_admin only.
 from __future__ import annotations
 
 import json
+import secrets
+import threading
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -38,6 +41,27 @@ class PublishResult(int):
     """publish_bid's return value: the number of flat-price offers re-priced (an int, so existing
     callers still compare it), with `.auto_hit` = how many offers the new bid then hit automatically."""
     auto_hit = 0
+
+
+def new_id() -> int:
+    """An id the app assigns itself: milliseconds since 2026-01-01, then 5 random digits.
+
+    Why not let Snowflake's IDENTITY pick it and read it back with MAX(id)? Snowflake does not promise
+    IDENTITY values increase (an integration run returned the same id for two different offers), so
+    "insert, then take the max" can hand back someone else's row. Assigning the id up front removes the
+    guesswork and keeps ids unique across concurrent writers. Within one process an id never repeats and
+    never goes backwards; across processes a clash needs two writers in the same millisecond AND the same
+    five random digits (about 1 in 100,000)."""
+    global _LAST_ID
+    with _ID_LOCK:
+        cand = (time.time_ns() // 1_000_000 - _EPOCH_MS) * 100_000 + secrets.randbelow(100_000)
+        _LAST_ID = cand if cand > _LAST_ID else _LAST_ID + 1
+        return _LAST_ID
+
+
+_EPOCH_MS = 1_767_225_600_000        # 2026-01-01T00:00:00Z
+_LAST_ID = 0
+_ID_LOCK = threading.Lock()
 
 
 def today_ct():
@@ -115,25 +139,26 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
     _require_staff(db, tenant_id, actor_id)
     if basis_cents is None and cash_price is None:
         raise PortalError("A bid needs a basis or a cash price.")
+    bid_id = new_id()
     _insert(db, "bids", dict(
-        tenant_id=tenant_id, location_id=location_id, grain=grain, delivery_month=delivery_month,
+        bid_id=bid_id, tenant_id=tenant_id, location_id=location_id, grain=grain, delivery_month=delivery_month,
         futures_symbol=futures_symbol, basis_cents=basis_cents, cash_price=cash_price,
         bushel_cap=bushel_cap, effective_date=today_ct().isoformat(), expires_at=expires_at,
         source_suggestion_id=source_suggestion_id, published_by=actor_id))
-    new_id = db.query("SELECT MAX(bid_id) AS b FROM bids WHERE tenant_id = %s", (tenant_id,))[0]["b"]
+    new_bid_id = bid_id
     old_ids = [r["bid_id"] for r in db.query(
         "SELECT bid_id FROM bids WHERE tenant_id = %s AND active AND bid_id <> %s AND grain = %s "
         "AND delivery_month = %s AND COALESCE(futures_symbol, '') = %s AND COALESCE(location_id, -1) = %s",
-        (tenant_id, new_id, grain, delivery_month, futures_symbol or "", location_id if location_id is not None else -1))]
+        (tenant_id, new_bid_id, grain, delivery_month, futures_symbol or "", location_id if location_id is not None else -1))]
     for oid in old_ids:
         db.execute("UPDATE bids SET active = FALSE WHERE bid_id = %s AND tenant_id = %s", (oid, tenant_id))
         # Outstanding offers made against the replaced bid follow the new one (any price type), so they
         # keep a live reference for pricing and for the hit check.
         db.execute("UPDATE offers SET bid_id = %s WHERE tenant_id = %s AND status = 'submitted' AND bid_id = %s",
-                   (new_id, tenant_id, oid))
+                   (new_bid_id, tenant_id, oid))
     _usage(db, tenant_id, "bid_published")
     _audit(db, tenant_id, actor_id, "bid_published", dict(grain=grain, delivery_month=delivery_month))
-    new_bid = db.query("SELECT * FROM bids WHERE bid_id = %s AND tenant_id = %s", (new_id, tenant_id))[0]
+    new_bid = db.query("SELECT * FROM bids WHERE bid_id = %s AND tenant_id = %s", (new_bid_id, tenant_id))[0]
     result = PublishResult(_reprice_flat_offers(db, tenant_id, new_bid, old_ids, actor_id))
     result.auto_hit = run_auto_hit(db, tenant_id)          # after re-pricing, so a hit locks the new implied futures
     return result
@@ -340,10 +365,10 @@ def ensure_farmer_for_user(db: Db, tenant_id: str, user: dict) -> int:
     if r:
         return r[0]["farmer_id"]
     who = user.get("name") or user["email"]
-    _insert(db, "farmers", dict(tenant_id=tenant_id, name=who, individual_name=who,
+    fid = new_id()
+    _insert(db, "farmers", dict(farmer_id=fid, tenant_id=tenant_id, name=who, individual_name=who,
                                 email=user["email"], user_id=user["user_id"], created_by=user["user_id"]))
-    return db.query("SELECT MAX(farmer_id) AS fid FROM farmers WHERE tenant_id = %s AND user_id = %s",
-                    (tenant_id, user["user_id"]))[0]["fid"]
+    return fid
 
 
 def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by, actor_id: int, *,
@@ -378,8 +403,9 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
                               delivery_start=delivery_start), list_bids(db, tenant_id))
     ref_basis = ref["basis_cents"] if (ref and price_type == "FIXED") else None
     imp = implied_futures(dict(price_type=price_type, price=price, contract_type=contract_type), ref_basis)
+    oid = new_id()
     _insert(db, "offers", dict(
-        basis_ref_cents=ref_basis, implied_futures=imp,
+        offer_id=oid, basis_ref_cents=ref_basis, implied_futures=imp,
         tenant_id=tenant_id, farmer_id=farmer_id, farmer_user_id=farmer_user_id, placed_by=placed_by,
         location_id=location_id, bid_id=bid_id, grain=grain, contract_type=contract_type,
         price_type=price_type, bushels=bushels, price=price, basis_cents=basis_cents,
@@ -387,8 +413,6 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         note=note, contract_ref=contract_ref, bid_snapshot=snapshot or {}, status="submitted",
         expires_at=expires_at),
         ("bid_snapshot",))
-    oid = db.query("SELECT MAX(offer_id) AS oid FROM offers WHERE tenant_id = %s AND farmer_id = %s",
-                   (tenant_id, farmer_id))[0]["oid"]
     _insert(db, "offer_events", dict(
         tenant_id=tenant_id, offer_id=oid, actor_user_id=actor_id, event_type="submitted",
         detail=dict(bushels=bushels, price=price, basis_cents=basis_cents,

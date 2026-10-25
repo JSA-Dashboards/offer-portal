@@ -14,6 +14,11 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 - **Auto-hit (admin only):** rules that mark an outstanding offer hit automatically when the posted bid reaches it
   (scope by location, commodity, contract type, largest offer). No active rules = never automatic.
 - **Hedge (admin only):** contracts to hedge and at what prices (implied futures / basis), by futures month.
+- **Delayed futures (placeholder):** `portal/massive.py` + `futures_run.py` store delayed Massive quotes (needs `MASSIVE_API_KEY`; never run
+  against the live API yet). Bids are sticky: a quote never changes a bid, it only stages an "indicated cash" suggestion that an admin confirms.
+  Staff always see delayed quotes; farmers only if the tenant's `show_futures` switch is on. Every futures price carries a delayed-quote notice.
+- **Theme:** CFTC-COT look (`portal/theme.py`), standard JSA disclaimer at the bottom of every page, white-label header/footer slots
+  (tenant logo, name, colors, support email) with JSA "Powered by" branding (`JSA_BRANDING` switch).
 - **Farmers:** customer records (client ID, entity, individual) that exist with or without a portal login.
 - **Platform console (JSA):** create tenants, branding, locations, scrape sources, usage report for billing.
 
@@ -26,7 +31,7 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 | `portal/scrapers.py`, `scrape_run.py` | Public cash-bid scrapers -> `bid_suggestions` staging |
 | `portal/db.py` | The only module that talks to a database (Snowflake; sqlite only inside tests) |
 | `sql/` | `00_database`, `01_schema`, `02_seed` (run in that order in the JSA Analytics account) |
-| `tests/` | pytest suite (runs on a local sqlite mirror of the schema) |
+| `tests/` | pytest suite (sqlite mirror of the schema); `tests/integration/snowflake_scenario.py` = real-Snowflake scenario, only against a `*_TEST` clone schema |
 
 ## Run
 ```
@@ -40,4 +45,4 @@ Settings (env or Streamlit secrets): `SNOWFLAKE_ACCOUNT/USER/ROLE/WAREHOUSE/DATA
 (local only: shows sign-in codes on screen).
 
 ## Not built yet
-Scraper schedule on the droplet, QST hedge bridge (phase 2).
+Futures job schedule + Massive key, notifications, e-signed contracts, ERP/position export, QST hedge bridge (phase 2).

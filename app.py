@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import html
 import os
+import pathlib
 import re
 from datetime import date
 
@@ -21,13 +22,15 @@ except Exception:
     pass
 
 import scrape_run
-from portal import auth, data, farmers, people, platform
+from portal import auth, data, farmers, futures, massive, people, platform, theme
 from portal.db import connect
 
 GRAINS = ("Corn", "Soybeans", "Wheat")
 DEV = os.environ.get("OFFER_PORTAL_DEV") == "1"
 
-st.set_page_config(page_title="Offer portal", page_icon=":material/grain:", layout="wide")
+_ICON = pathlib.Path(__file__).parent / "assets" / "jsa_favicon.png"
+st.set_page_config(page_title="Offer portal", page_icon=str(_ICON) if _ICON.exists() else ":material/grain:",
+                   layout="wide")
 
 
 @st.cache_resource
@@ -44,16 +47,29 @@ def _months(n: int = 24) -> list[str]:
     return out
 
 
-def _brand(tenant: dict) -> None:
-    """Per-tenant look: the one place we inject CSS (white-label accent only)."""
-    color = tenant.get("primary_color") or "#32373c"
-    accent = tenant.get("accent_color") or "#0693e3"
-    if not (re.fullmatch(r"#[0-9a-fA-F]{6}", color) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent)):
-        color, accent = "#32373c", "#0693e3"
-    st.html(f"<style>h1,h2,h3{{color:{color}}} .stButton>button[kind='primary']"
-            f"{{background:{accent};border-color:{accent}}}</style>")
-    if tenant.get("logo_url"):
-        st.logo(tenant["logo_url"])
+def _brand(tenant: dict | None) -> None:
+    """The COT-style theme, with this tenant's colors, plus the header (tenant logo/name left, JSA 'Powered by' right)."""
+    st.session_state["_futures_shown"] = False             # views set this when they draw a futures price
+    st.markdown(theme.css(tenant), unsafe_allow_html=True)
+    st.markdown(theme.header_html(tenant), unsafe_allow_html=True)
+
+
+def _end(tenant: dict | None = None) -> None:
+    """The compliance footer (standard JSA disclaimer; adds the delayed-quote notice on a page that showed
+    futures). Called at the end of every page, including the sign-in and error pages."""
+    st.markdown(theme.footer_html(tenant, delayed=bool(st.session_state.get("_futures_shown"))),
+                unsafe_allow_html=True)
+
+
+def _stop(tenant: dict | None = None) -> None:
+    _end(tenant)
+    st.stop()
+
+
+def _may_see_futures(tenant: dict | None, user: dict) -> bool:
+    """Delayed futures are always visible to elevator staff; farmers see them only when JSA has switched
+    that on for the tenant (market-data licensing)."""
+    return user["role"] != "farmer" or bool((tenant or {}).get("show_futures"))
 
 
 def _send_code(tenant: dict):
@@ -70,7 +86,6 @@ def _send_code(tenant: dict):
 
 
 def login_view(db, tenant: dict) -> None:
-    st.title(tenant["name"])
     st.caption("Sign in with your email — we'll send you a one-time code.")
     step = st.session_state.get("login_step", "email")
     if step == "email":
@@ -105,6 +120,11 @@ def login_view(db, tenant: dict) -> None:
             st.rerun()
 
 
+def _md(text: str) -> str:
+    """Escape dollar signs for st.markdown: two of them in one string turn the text between into LaTeX math."""
+    return str(text).replace("$", "\\$")
+
+
 def _refresh() -> None:
     """Rerun just the calling fragment; a full rerun when not in a fragment run (e.g. AppTest)."""
     try:
@@ -127,23 +147,41 @@ def _repriced_msg(n: int) -> str:
     return msg
 
 
-def _bid_rows(bids: list[dict], locs: dict) -> list[dict]:
-    return [{"Location": locs.get(b["location_id"], "—"), "Grain": b["grain"],
-             "Delivery": b["delivery_month"], "Futures": b["futures_symbol"] or "",
-             "Basis (¢)": b["basis_cents"], "Cash ($/bu)": b["cash_price"],
-             "Bushel cap": b["bushel_cap"]} for b in bids]
+def _bid_rows(bids: list[dict], locs: dict, quotes: dict | None = None) -> list[dict]:
+    rows = []
+    for b in bids:
+        row = {"Location": locs.get(b["location_id"], "—"), "Grain": b["grain"],
+               "Delivery": b["delivery_month"], "Futures": b["futures_symbol"] or "",
+               "Basis (¢)": b["basis_cents"], "Cash ($/bu)": b["cash_price"], "Bushel cap": b["bushel_cap"]}
+        if quotes is not None:                       # delayed futures + what they would indicate; the posted bid is unchanged
+            q = quotes.get(b["futures_symbol"])
+            row["Futures, delayed ($/bu)"] = q["price"] if q else None
+            row["Indicated cash ($/bu)"] = futures.indicated_cash(b, q)
+        rows.append(row)
+    return rows
+
+
+def _futures_banner(quotes: dict) -> None:
+    st.markdown(theme.delayed_banner_html(futures.latest_stamp(quotes)), unsafe_allow_html=True)
+    st.session_state["_futures_shown"] = True
 
 
 @st.fragment
-def published_view(db, tenant_id: str, user: dict, editable: bool) -> None:
+def published_view(db, tenant_id: str, user: dict, editable: bool, tenant: dict | None = None) -> None:
     if msg := st.session_state.pop("bid_msg", None):
         st.success(msg)
     locs = _loc_names(db, tenant_id)
     bids = data.list_bids(db, tenant_id)
+    quotes = None
+    if bids and _may_see_futures(tenant, user):
+        quotes = futures.list_quotes(db, {b["futures_symbol"] for b in bids if b["futures_symbol"]}) or None
     if not bids:
         st.info("No bids are posted right now.")
     else:
-        st.dataframe(_bid_rows(bids, locs), hide_index=True, width="stretch")
+        if quotes:
+            _futures_banner(quotes)
+        st.dataframe(_bid_rows(bids, locs, quotes), hide_index=True, width="stretch")
+        st.caption("Bids stay as posted until an elevator administrator updates and confirms them.")
     if not editable:
         return
     if bids:
@@ -179,21 +217,35 @@ def published_view(db, tenant_id: str, user: dict, editable: bool) -> None:
 def suggestions_view(db, tenant_id: str, user: dict) -> None:
     if msg := st.session_state.pop("bid_msg", None):
         st.success(msg)
-    st.caption("Bids pulled from your public cash-bid page. Nothing reaches farmers until you approve it.")
+    st.caption("Bids pulled from your public cash-bid page, and cash prices suggested from delayed futures. "
+               "Nothing reaches farmers until you approve it: posted bids are sticky.")
     locs = _loc_names(db, tenant_id)
     sugg = data.list_suggestions(db, tenant_id)
     if not sugg:
         st.info("Nothing waiting for review.")
         return
+    live = {(b["location_id"], b["grain"], b["delivery_month"], b["futures_symbol"]): b for b in data.list_bids(db, tenant_id)}
+    quotes = futures.list_quotes(db)
+    if any(str(s["source"]).startswith("massive") for s in sugg) and quotes:
+        _futures_banner(quotes)
     for s in sugg:
         with st.container(border=True, horizontal=True, vertical_alignment="bottom"):
-            st.markdown(f"**{locs.get(s['location_id'], '—')}** · {s['grain']} · {s['delivery_month']}"
-                        f"  \n{s['futures_symbol'] or ''} · source: {s['source']}")
+            posted = live.get((s["location_id"], s["grain"], s["delivery_month"], s["futures_symbol"]))
+            note = ""
+            if str(s["source"]).startswith("massive"):
+                q = quotes.get(s["futures_symbol"])
+                note = (f"  \nFrom delayed futures {q['price']:.4f} + basis" if q else "  \nFrom delayed futures")
+            if posted and posted["cash_price"] is not None:
+                note += f"  \nPosted now: ${posted['cash_price']:.2f} (stays until you approve)"
+            st.markdown(_md(f"**{locs.get(s['location_id'], '—')}** · {s['grain']} · {s['delivery_month']}"
+                            f"  \n{s['futures_symbol'] or ''} · source: {s['source']}{note}"))
             basis = st.number_input("Basis (¢)", value=s["basis_cents"], step=1, format="%d",
                                     key=f"sb_{s['suggestion_id']}")
+            cash = st.number_input("Cash ($/bu)", value=s["cash_price"], step=0.01, format="%.2f",
+                                   key=f"sc_{s['suggestion_id']}")
             if st.button("Approve", key=f"ok_{s['suggestion_id']}", type="primary"):
                 n = data.review_suggestion(db, tenant_id, user["user_id"], s["suggestion_id"], True,
-                                           basis_cents=basis)
+                                           basis_cents=basis, cash_price=cash)
                 st.session_state["bid_msg"] = _repriced_msg(n)
                 _refresh()
             if st.button("Discard", key=f"no_{s['suggestion_id']}"):
@@ -302,10 +354,10 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
             line.append(data.bid_gap(o))
         if staff and o.get("hedged_at"):
             line.append("hedged")
-        st.markdown(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]")
+        st.markdown(_md(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]"))
         if staff and o.get("bid_reached"):
             st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
-        meta = [x for x in (f"Delivery {o['delivery_start']} → {o['delivery_end']}" if o["delivery_start"] else "",
+        meta = [x for x in ((f"Delivery {o['delivery_start']}" + (f" → {o['delivery_end']}" if o["delivery_end"] else "")) if o["delivery_start"] else "",
                             f"Good until {str(o['expires_at'])[:10]}" if o["expires_at"] else "",
                             (f"Hit automatically {str(o['hit_at'])[:10]}" if o.get("auto_hit") else
                              f"Hit {str(o['hit_at'])[:10]}") if o.get("hit_at") else "",
@@ -313,7 +365,7 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                             f"Contract # {o['contract_ref']}" if o.get("contract_ref") else "",
                             o["note"] or "") if x]
         if meta:
-            st.caption(" · ".join(meta))
+            st.caption(_md(" · ".join(meta)))
         if staff:
             with st.expander("Edit notes / contract #"):
                 with st.form(f"details_{o['offer_id']}", border=False):
@@ -403,7 +455,6 @@ def _email_invite(tenant: dict, email: str, link: str) -> bool:
 
 
 def join_view(db, tenant: dict, token: str) -> None:
-    st.title(tenant["name"])
     inv = people.invite_preview(db, token, tenant["tenant_id"])
     if not inv:
         st.error("This invite link is invalid, expired, or already used. Ask your elevator for a new one.")
@@ -491,11 +542,14 @@ def _tenant_editor(db, user: dict, t: dict) -> None:
         c5, c6 = st.columns(2)
         open_pricing = c5.toggle("Farmers may propose any price", bool(t["open_pricing"]))
         hedging = c6.toggle("Hedging enabled (phase 2)", bool(t["hedging_enabled"]))
+        show_fut = st.toggle("Farmers can see delayed futures quotes (staff always can; check market-data licensing)",
+                             bool(t.get("show_futures")))
         if st.form_submit_button("Save settings", type="primary"):
             try:
                 platform.update_tenant(db, uid, tid, name=name, logo_url=logo, primary_color=primary,
                                        accent_color=accent, support_email=support, from_name=from_name,
-                                       open_pricing=open_pricing, hedging_enabled=hedging)
+                                       open_pricing=open_pricing, hedging_enabled=hedging,
+                                       show_futures=show_fut)
                 st.success("Saved.")
             except data.PortalError as e:
                 st.error(str(e))
@@ -741,11 +795,13 @@ def _level_label(b: dict) -> str:
     return f"{int(b['level']):+d}¢ basis" if b["kind"] == "Basis (HTA)" else f"{b['level']:.4f}"
 
 
-def _hedge_tables(totals: list[dict], lines: list[dict]) -> None:
+def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = None) -> None:
     st.markdown("**Contracts by futures month**")
     st.dataframe([{"Commodity": t["grain"], "Futures month": t["futures_symbol"], "Offers": t["offers"],
                    "Bushels": t["bushels"], "Contracts": t["contracts"], "Whole contracts": t["whole_contracts"],
-                   "Left over (bu)": t["remainder_bushels"]} for t in totals],
+                   "Left over (bu)": t["remainder_bushels"],
+                   **({"Futures, delayed ($/bu)": (quotes.get(t["futures_symbol"]) or {}).get("price")}
+                      if quotes else {})} for t in totals],
                  hide_index=True, width="stretch",
                  column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
     st.markdown("**By price level**")
@@ -763,15 +819,18 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
         st.error("This page is for elevator admins.")
         return
     h = data.hedge_summary(db, tenant_id, user["user_id"])
+    quotes = futures.list_quotes(db, {t["futures_symbol"] for t in h["now_totals"] + h["potential_totals"]}) or None
+    if quotes:
+        _futures_banner(quotes)
     st.subheader("Hit offers: hedge now")
     if not h["now"]:
         st.info("No hit offers are waiting to be hedged.")
     else:
-        _hedge_tables(h["now_totals"], h["now"])
+        _hedge_tables(h["now_totals"], h["now"], quotes)
         with st.expander("Mark offers as hedged"):
             picks = st.multiselect("Hit offers not yet hedged", h["now_offers"], key="hedge_pick",
                                    format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
-                                                         f"{o['futures_symbol']} · #{o['offer_id']}")
+                                                         f"{o['futures_symbol']} · {o['price_type'].lower()} offer")
             if st.button("Mark selected as hedged", key="hedge_go", disabled=not picks):
                 data.mark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in picks])
                 _refresh()
@@ -779,7 +838,7 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
     if not h["potential"]:
         st.info("No outstanding offers.")
     else:
-        _hedge_tables(h["potential_totals"], h["potential"])
+        _hedge_tables(h["potential_totals"], h["potential"], quotes)
     st.caption("Contracts = bushels divided by the contract size (5,000 bu for corn, soybeans and wheat). "
                "Flat-price offers show the implied futures price (flat price less the posted basis), and it moves "
                "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")
@@ -858,14 +917,15 @@ def main() -> None:
     try:
         db = get_db()
     except Exception:
+        _brand(None)
         st.error("The portal can't reach its database. Please contact JSA support.")
-        st.stop()
+        _stop()
     slug = (st.query_params.get("t") or "").strip().lower()
     tenant = data.get_tenant(db, slug) if slug else None
     if not tenant:
-        st.title("Offer portal")
+        _brand(None)
         st.info("Please use the link your elevator gave you.")
-        st.stop()
+        _stop()
     _brand(tenant)
 
     user = st.session_state.get("user")
@@ -875,9 +935,8 @@ def main() -> None:
             join_view(db, tenant, st.query_params["invite"])
         else:
             login_view(db, tenant)
-        st.stop()
+        _stop(tenant)
 
-    st.title(tenant["name"])
     with st.sidebar:
         st.caption(f"{user['email']} · {user['role'].replace('_', ' ')}")
         if st.button("Sign out"):
@@ -911,11 +970,12 @@ def main() -> None:
     elif view == "Review scraped bids":
         suggestions_view(db, tid, user)
     elif view == "Bid board":
-        published_view(db, tid, user, editable=staff)
+        published_view(db, tid, user, editable=staff, tenant=tenant)
     elif view == "Make an offer":
         offer_form_view(db, tenant, user)
     else:
         offers_view(db, tid, user, staff)
+    _end(tenant)
 
 
 main()
