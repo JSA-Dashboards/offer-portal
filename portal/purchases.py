@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from datetime import date, datetime
 
+from . import contracts
 from .data import CONTRACT_BUSHELS, PortalError, _audit, _insert, _require_staff, new_id, today_ct
 from .db import Db
 
@@ -32,9 +33,15 @@ def add_purchase(db: Db, tenant_id: str, staff_id: int, *, grain: str, bushels: 
         raise PortalError("Enter the flat price, the basis, or both.")
     if price is not None and price <= 0:
         raise PortalError("The price must be positive.")
+    grain = contracts.canon_grain(grain)
     sym = (futures_symbol or "").strip().upper() or None
     if basis_cents is not None and not sym:
         raise PortalError("A basis purchase needs its futures month (e.g. ZCZ26).")
+    if sym:
+        try:
+            sym = contracts.check_symbol(grain, sym)
+        except ValueError as e:
+            raise PortalError(str(e)) from None
     period = (delivery_period or "").strip() or None
     if period and not _PERIOD.match(period):
         raise PortalError("Delivery period must look like 2026-12.")

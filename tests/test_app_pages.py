@@ -1,4 +1,4 @@
-from portal import data, farmers
+from portal import contracts, data, farmers
 from test_app import _as, app_db  # noqa: F401  (fixture + signed-in session helper)
 import conftest
 
@@ -107,14 +107,14 @@ def test_hedge_page_shows_contracts_and_marks_offers_hedged(app_db):
 
 def test_posting_a_bid_reports_how_many_flat_offers_were_repriced(app_db):
     # The form posts for the first location (id 1), so the live bid must be that location's slot.
-    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol="ZCZ26",
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol=contracts.options("Corn")[0],
                      location_id=1, basis_cents=-38, cash_price=4.18)
     bid = data.list_bids(app_db, "rcm")[0]["bid_id"]
     hit = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
     data.act_on_offer(app_db, "rcm", conftest.user(app_db, 2), hit, "hit")                 # locked, not repriced
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
     at = _go(_as(app_db, 2), "Bid board")
-    next(t for t in at.text_input if t.label == "Futures symbol").set_value("zcz26")
+    next(s for s in at.selectbox if s.label.startswith("Commodity and futures month")).set_value("Corn|" + contracts.options("Corn")[0])
     next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
     next(s for s in at.selectbox if s.label == "Delivery month").set_value(data_month())
     next(b for b in at.button if b.label == "Post bid").click().run()
@@ -171,13 +171,13 @@ def test_rule_toggle_and_check_now(app_db):
 
 def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
     data.add_auto_hit_rule(app_db, "rcm", 2)
-    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol="ZCZ26",
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol=contracts.options("Corn")[0],
                      location_id=1, basis_cents=-38, cash_price=4.18)
     oid = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT,
                             bid_id=data.list_bids(app_db, "rcm")[0]["bid_id"])           # 4.30 > bid 4.18: outstanding
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
     at = _go(_as(app_db, 2), "Bid board")
-    next(t for t in at.text_input if t.label == "Futures symbol").set_value("zcz26")
+    next(s for s in at.selectbox if s.label.startswith("Commodity and futures month")).set_value("Corn|" + contracts.options("Corn")[0])
     next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
     next(n for n in at.number_input if n.label.startswith("Cash")).set_value(4.35)
     next(s for s in at.selectbox if s.label == "Delivery month").set_value(data_month())

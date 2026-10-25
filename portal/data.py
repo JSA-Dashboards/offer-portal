@@ -14,6 +14,7 @@ import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+from . import contracts
 from .db import Db
 
 CT = ZoneInfo("America/Chicago")          # Cloud hosts run UTC; business dates are Central
@@ -29,7 +30,7 @@ _TRANSITIONS = {
                   "withdraw": ("withdrawn", ("farmer",)), "expire": ("expired", ())},
 }                                     # hit -> acknowledged -> completed: acknowledge_offer / complete_offer; cancel_offer after a hit
 
-CONTRACT_BUSHELS = {"Corn": 5000, "Soybeans": 5000, "Wheat": 5000}     # CBOT futures contract size
+CONTRACT_BUSHELS = {**{g: sp["bushels"] for g, sp in contracts.SPECS.items()}, **{k: 5000 for k in contracts.LEGACY}}
 STATUS_LABELS = {"submitted": "Outstanding", "hit": "Hit", "acknowledged": "Acknowledged", "completed": "Completed",
                  "declined": "Declined", "withdrawn": "Withdrawn", "expired": "Expired", "cancelled": "Cancelled"}
 HELD = ("hit", "acknowledged")        # the elevator owns the grain and the hedge question is open
@@ -192,6 +193,14 @@ def retire_bid(db: Db, tenant_id: str, actor_id: int, bid_id: int) -> None:
     _audit(db, tenant_id, actor_id, "bid_retired", dict(bid_id=bid_id))
 
 
+def _futures_month(grain, symbol) -> str:
+    """Every bid and offer names the futures month it is hedged against; PortalError if it is missing or not listed."""
+    try:
+        return contracts.check_symbol(grain, symbol)
+    except ValueError as e:
+        raise PortalError(str(e)) from None
+
+
 def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_month: str,
                 location_id=None, futures_symbol=None, basis_cents=None, cash_price=None,
                 bushel_cap=None, expires_at=None, source_suggestion_id=None,
@@ -200,6 +209,8 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
     futures month). Returns a PublishResult: how many outstanding flat-price offers had their implied
     futures re-computed because the basis moved, and (.auto_hit) how many offers it then hit."""
     _require_staff(db, tenant_id, actor_id)
+    grain = contracts.canon_grain(grain)
+    futures_symbol = _futures_month(grain, futures_symbol)
     if basis_cents is None and cash_price is None:
         raise PortalError("A bid needs a basis or a cash price.")
     mb = month_bounds(delivery_month)
@@ -241,6 +252,7 @@ def stage_suggestion(db: Db, tenant_id: str, *, grain: str, delivery_month: str,
     ds, de = _to_date(delivery_start), _to_date(delivery_end)
     if not (ds and de and de >= ds):
         ds = de = None
+    grain = contracts.canon_grain(grain)
     _insert(db, "bid_suggestions", dict(
         tenant_id=tenant_id, location_id=location_id, grain=grain, delivery_month=delivery_month,
         delivery_start=ds.isoformat() if ds else None, delivery_end=de.isoformat() if de else None,
@@ -309,7 +321,8 @@ def review_suggestion(db: Db, tenant_id: str, actor_id: int, suggestion_id: int,
             raise PortalError("Enter the delivery date range (from and to) before approving: the source did not give a "
                               "clear one, and offers expire when it ends.")
         repriced = publish_bid(db, tenant_id, actor_id, grain=s["grain"], delivery_month=s["delivery_month"],
-                    location_id=s["location_id"], futures_symbol=s["futures_symbol"],
+                    location_id=s["location_id"],
+                    futures_symbol=overrides.get("futures_symbol", s["futures_symbol"]),
                     basis_cents=overrides.get("basis_cents", s["basis_cents"]),
                     cash_price=overrides.get("cash_price", s["cash_price"]),
                     source_suggestion_id=suggestion_id, delivery_start=ds, delivery_end=de)
@@ -524,8 +537,8 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         raise PortalError("Bushels must be positive.")
     if price_type == "FIXED" and price is None:
         raise PortalError("A fixed-price offer needs a price.")
-    if not (futures_symbol or "").strip():
-        raise PortalError("A futures month is required (e.g. ZCZ26).")
+    grain = contracts.canon_grain(grain)
+    futures_symbol = _futures_month(grain, futures_symbol)
     if price_type == "BASIS" and basis_cents is None:
         raise PortalError("A basis offer needs a basis and a futures symbol.")
     note, contract_ref = _clean_details(note, contract_ref)
@@ -1010,6 +1023,11 @@ def offer_summary(db: Db, tenant_id: str, staff_id: int, *, grains=None, periods
     return dict(groups=out, offers=rows)
 
 
+def _grain_rank(grain) -> int:
+    g = contracts.canon_grain(grain)
+    return contracts.GRAINS.index(g) if g in contracts.GRAINS else len(contracts.GRAINS)
+
+
 def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     """What the elevator has to (or may have to) hedge. Admin only.
 
@@ -1037,10 +1055,11 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
                 kind, level = "Flat price", o["implied_futures"]
             key = (o["grain"], o["futures_symbol"], kind, level)
             b = buckets.setdefault(key, dict(grain=o["grain"], futures_symbol=o["futures_symbol"], kind=kind,
+                                             futures_month=contracts.futures_label(o["futures_symbol"]),
                                              level=level, offers=0, bushels=0))
             b["offers"] += 1
             b["bushels"] += o["bushels"]
-        lines = sorted(buckets.values(), key=lambda b: (b["grain"], b["futures_symbol"] or "", b["kind"],
+        lines = sorted(buckets.values(), key=lambda b: (_grain_rank(b["grain"]), contracts.sort_key(b["futures_symbol"]), b["kind"],
                                                          -(b["level"] if b["level"] is not None else -1e9)))
         for b in lines:
             size = CONTRACT_BUSHELS.get(b["grain"], 5000)
@@ -1048,7 +1067,9 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
         totals: dict = {}
         for b in lines:
             t = totals.setdefault((b["grain"], b["futures_symbol"]), dict(
-                grain=b["grain"], futures_symbol=b["futures_symbol"], offers=0, bushels=0))
+                grain=b["grain"], futures_symbol=b["futures_symbol"], futures_month=b["futures_month"],
+                exchange=(contracts.SPECS.get(contracts.canon_grain(b["grain"])) or {}).get("exchange", ""),
+                offers=0, bushels=0))
             t["offers"] += b["offers"]
             t["bushels"] += b["bushels"]
         for t in totals.values():
@@ -1056,7 +1077,7 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
             t["contracts"] = round(t["bushels"] / size, 2)
             t["whole_contracts"] = t["bushels"] // size
             t["remainder_bushels"] = t["bushels"] % size
-        return lines, sorted(totals.values(), key=lambda t: (t["grain"], t["futures_symbol"] or ""))
+        return lines, sorted(totals.values(), key=lambda t: (_grain_rank(t["grain"]), contracts.sort_key(t["futures_symbol"])))
 
     now_lines, now_totals = build(now)
     pot_lines, pot_totals = build(potential)

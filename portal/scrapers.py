@@ -11,6 +11,7 @@ import json
 import re
 from datetime import datetime
 
+from .contracts import SPECS
 from .data import month_bounds
 
 import requests
@@ -24,13 +25,22 @@ _MON = {"jan": "F", "feb": "G", "mar": "H", "apr": "J", "may": "K", "jun": "M",
         "jul": "N", "aug": "Q", "sep": "U", "oct": "V", "nov": "X", "dec": "Z"}
 _MONNUM = {m: i + 1 for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"))}
-_ROOT = {"Corn": "ZC", "Soybeans": "ZS", "Wheat": "ZW"}
+_ROOT = {g: sp["root"] for g, sp in SPECS.items()}
 HARVEST_MONTH = 10          # "Harvest 2026" -> 2026-10 (approximate; the admin confirms every bid)
 
 
 def norm_grain(text: str) -> str:
     t = (text or "").lower()
-    return "Soybeans" if "bean" in t else "Wheat" if "wheat" in t else "Corn"
+    if "bean" in t:
+        return "Soybeans"
+    if "wheat" in t:
+        # A plain "wheat" line is CBOT soft red; hard red and spring are named by class (the admin confirms every bid).
+        if "hrw" in t or "hard red" in t or "hard winter" in t:
+            return "HRW Wheat"
+        if "hrs" in t or "spring" in t or "dark northern" in t:
+            return "HRS Wheat"
+        return "SRW Wheat"
+    return "Corn"
 
 
 def _money(v) -> float | None:

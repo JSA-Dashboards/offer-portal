@@ -325,11 +325,11 @@ check(all(b["bid_id"] for b in data.list_bids(db, slug)), "live bids intact")
 step("delivery ranges (needs sql/08): bid window in DATE columns, offers expire the day after the last delivery day, unclear scrapes need a range")
 today = data.today_ct()
 D = lambda n: (today + timedelta(days=n)).isoformat()
-data.publish_bid(db, slug, S, grain="Wheat", delivery_month=today.strftime("%Y-%m"), location_id=locs["Main"], futures_symbol="ZWZ26",
+data.publish_bid(db, slug, S, grain="SRW Wheat", delivery_month=today.strftime("%Y-%m"), location_id=locs["Main"], futures_symbol="ZWZ26",
                  basis_cents=-20, cash_price=6.0, delivery_start=D(-10), delivery_end=D(3))
-wb = [b for b in data.list_bids(db, slug) if b["grain"] == "Wheat"][0]
+wb = [b for b in data.list_bids(db, slug) if b["grain"] == "SRW Wheat"][0]
 check(isinstance(wb["window_end"], date) and str(wb["window_start"]) == D(-10) and str(wb["window_end"]) == D(3), wb)
-W = dict(grain="Wheat", contract_type="HTA", price_type="BASIS", bushels=5000, basis_cents=-25, futures_symbol="ZWZ26")
+W = dict(grain="SRW Wheat", contract_type="HTA", price_type="BASIS", bushels=5000, basis_cents=-25, futures_symbol="ZWZ26")
 w_bid = data.create_offer(db, slug, pat, **W, bid_id=wb["bid_id"])                       # inherits the bid's range
 w_today = data.create_offer(db, slug, pat, **W, delivery_end=D(0))                      # the last day itself is still alive
 raises(lambda: data.create_offer(db, slug, pat, **W, delivery_end=D(-1)), "a delivery period that already ended is refused")

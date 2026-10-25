@@ -76,7 +76,7 @@ def test_locations_and_sources(db):
 
 
 def test_usage_table_rolls_up_by_tenant(db):
-    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", basis_cents=-38)
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", basis_cents=-38, futures_symbol="ZCZ26")
     oid = data.create_offer(db, "rcm", db.query("SELECT * FROM users WHERE user_id = 1")[0], grain="Corn",
                             contract_type="HTA", price_type="BASIS", bushels=1000, basis_cents=-30,
                             futures_symbol="ZCZ26")

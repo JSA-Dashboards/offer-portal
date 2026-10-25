@@ -84,7 +84,7 @@ def test_staff_lands_on_offers_inbox_and_can_mark_hit(app_db):
 
 
 def test_staff_bid_board_has_post_controls(app_db):
-    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38)
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
     at = _as(app_db, 2)
     at.radio[0].set_value("Bid board").run()
     assert not at.exception
@@ -116,7 +116,7 @@ def test_farmer_makes_offer(app_db):
 
 
 def test_farmer_view_is_read_only_board(app_db):
-    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38)
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
     at = _sign_in(run(t="rcm"), app_db, "f@a.com")
     assert not at.exception
     assert at.dataframe

@@ -22,10 +22,10 @@ except Exception:
     pass
 
 import scrape_run
-from portal import auth, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
+from portal import auth, contracts, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
 from portal.db import connect
 
-GRAINS = ("Corn", "Soybeans", "Wheat")
+GRAINS = contracts.GRAINS
 DEV = os.environ.get("OFFER_PORTAL_DEV") == "1"
 
 _ICON = pathlib.Path(__file__).parent / "assets" / "jsa_favicon.png"
@@ -36,6 +36,16 @@ st.set_page_config(page_title="Offer portal", page_icon=str(_ICON) if _ICON.exis
 @st.cache_resource
 def get_db():
     return connect()
+
+
+def _markets(count: int = 6) -> list[str]:
+    """Every commodity's next listed futures months as 'Corn|ZCZ26' choices: one pick names the market and the month."""
+    return [f"{g}|{s}" for g in GRAINS for s in contracts.options(g, date.today(), count)]
+
+
+def _market_label(choice: str) -> str:
+    g, s = choice.split("|")
+    return f"{g} · {contracts.futures_label(s)} ({s})"
 
 
 def _months(n: int = 24) -> list[str]:
@@ -214,10 +224,10 @@ def published_view(db, tenant_id: str, user: dict, editable: bool, tenant: dict 
         with st.form("post_bid", clear_on_submit=True):
             c1, c2, c3 = st.columns(3)
             loc_id = c1.selectbox("Location", list(locs), format_func=locs.get)
-            grain = c2.selectbox("Grain", GRAINS)
+            market = c2.selectbox("Commodity and futures month (what it hedges against)", _markets(),
+                                  format_func=_market_label)
             month = c3.selectbox("Delivery month", _months())
             c4, c5, c6, c7 = st.columns(4)
-            fut = c4.text_input("Futures symbol", placeholder="ZCZ26")
             basis = c5.number_input("Basis (¢, e.g. -38)", value=None, step=1, format="%d")
             cash = c6.number_input("Cash price ($/bu)", value=None, step=0.01, format="%.2f")
             cap = c7.number_input("Bushel cap", value=None, min_value=0, step=1000, format="%d")
@@ -226,8 +236,9 @@ def published_view(db, tenant_id: str, user: dict, editable: bool, tenant: dict 
             wt = w2.date_input("Delivery to (offers expire the day after this)", value=None)
             if st.form_submit_button("Post bid", type="primary"):
                 try:
+                    grain, fut = market.split("|")
                     n = data.publish_bid(db, tenant_id, user["user_id"], grain=grain, delivery_month=month,
-                                         location_id=loc_id, futures_symbol=(fut.strip().upper() or None),
+                                         location_id=loc_id, futures_symbol=fut,
                                          basis_cents=basis, cash_price=cash, bushel_cap=cap,
                                          delivery_start=wf.isoformat() if wf else None,
                                          delivery_end=wt.isoformat() if wt else None)
@@ -322,17 +333,17 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
     k = bid["bid_id"] if bid else "open"
     with st.form(f"{kp}offer_form_{k}", clear_on_submit=True):
         c1, c2, c3 = st.columns(3)
-        grain = bid["grain"] if bid else c1.selectbox("Grain", GRAINS)
         if bid:
-            c1.text_input("Grain", grain, disabled=True)
+            grain, fut = bid["grain"], bid["futures_symbol"]
+            c1.text_input("Commodity and futures month", f"{grain} · {contracts.futures_label(fut)} ({fut})", disabled=True)
+        else:
+            grain, fut = c1.selectbox("Commodity and futures month", _markets(), format_func=_market_label).split("|")
         contract = c2.selectbox("Contract type", list(data.CONTRACT_TYPES),
                                 format_func=CONTRACT_LABELS.get)
         bushels = c3.number_input("Bushels", min_value=0, step=1000, value=5000, format="%d")
-        c4, c5, c6 = st.columns(3)
+        c4, c5 = st.columns(2)
         ptype = c4.segmented_control("Price type", list(data.PRICE_TYPES), default="BASIS")
         basis = c5.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d")
-        fut = c6.text_input("Futures month (e.g. ZCZ26)", value=(bid["futures_symbol"] or "") if bid else "",
-                            placeholder="ZCZ26")
         price = st.number_input("Fixed price ($/bu) — for fixed-price offers",
                                 value=bid["cash_price"] if bid else None, step=0.01, format="%.2f")
         c7, c8, c9 = st.columns(3)
@@ -354,7 +365,7 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
                 grain=grain, contract_type=contract, price_type=ptype or "BASIS",
                 bushels=int(bushels), price=price if ptype == "FIXED" else None,
                 basis_cents=basis if ptype != "FIXED" else None,
-                futures_symbol=(fut.strip().upper() or None), bid_id=bid["bid_id"] if bid else None,
+                futures_symbol=fut, bid_id=bid["bid_id"] if bid else None,
                 location_id=bid["location_id"] if bid else None,
                 delivery_start=start.isoformat() if start else None,
                 delivery_end=end.isoformat() if end else None, note=note or None,
@@ -873,7 +884,8 @@ def _level_label(b: dict) -> str:
 
 def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = None) -> None:
     st.markdown("**Contracts by futures month**")
-    st.dataframe([{"Commodity": t["grain"], "Futures month": t["futures_symbol"], "Offers": t["offers"],
+    st.dataframe([{"Commodity": t["grain"], "Futures month": f"{t['futures_month']} ({t['futures_symbol']})",
+                   "Exchange": t["exchange"], "Offers": t["offers"],
                    "Bushels": t["bushels"], "Contracts": t["contracts"], "Whole contracts": t["whole_contracts"],
                    "Left over (bu)": t["remainder_bushels"],
                    **({"Futures, delayed ($/bu)": (quotes.get(t["futures_symbol"]) or {}).get("price")}
@@ -881,7 +893,7 @@ def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = N
                  hide_index=True, width="stretch",
                  column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
     st.markdown("**By price level**")
-    st.dataframe([{"Commodity": b["grain"], "Futures month": b["futures_symbol"], "Type": b["kind"],
+    st.dataframe([{"Commodity": b["grain"], "Futures month": f"{b['futures_month']} ({b['futures_symbol']})", "Type": b["kind"],
                    "Price level": _level_label(b), "Offers": b["offers"], "Bushels": b["bushels"],
                    "Contracts": b["contracts"]} for b in lines],
                  hide_index=True, width="stretch",
@@ -1021,18 +1033,18 @@ def purchases_view(db, tenant: dict, user: dict) -> None:
                                  format_func=lambda f: "Type a name instead…" if f is None else _farmer_label(f))
             typed = c2.text_input("…or type the entity or person")
             c3, c4, c5, c6 = st.columns(4)
-            grain = c3.selectbox("Commodity", GRAINS)
+            market = c3.selectbox("Commodity and futures month", _markets(), format_func=_market_label)
             bushels = c4.number_input("Bushels", min_value=0, step=1000, value=None, format="%d")
             price = c5.number_input("Flat price ($/bu)", value=None, step=0.01, format="%.4f")
             basis = c6.number_input("Basis (¢)", value=None, step=1, format="%d")
             c7, c8, c9, c10 = st.columns(4)
-            fut = c7.text_input("Futures month (e.g. ZCZ26)")
             loc = c8.selectbox("Delivery location", [None] + list(locs), format_func=lambda x: "—" if x is None else locs[x])
             period = c9.selectbox("Delivery period", [""] + _months(), format_func=lambda x: x or "—")
             ref = c10.text_input("Contract #")
             note = st.text_input("Note")
             if st.form_submit_button("Log purchase", type="primary"):
                 try:
+                    grain, fut = market.split("|")
                     purchases.add_purchase(
                         db, tid, user["user_id"], grain=grain, bushels=int(bushels or 0), counterparty=typed or None,
                         farmer_id=fpick["farmer_id"] if fpick else None, price=price,

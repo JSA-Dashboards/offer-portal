@@ -18,7 +18,7 @@ OFFER = dict(grain="Corn", contract_type="HTA", price_type="BASIS", bushels=5000
 
 def test_tenant_cannot_see_other_tenant_data(db):
 
-    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", basis_cents=-38)
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", basis_cents=-38, futures_symbol="ZCZ26")
 
     assert len(data.list_bids(db, "rcm")) == 1
 
@@ -52,8 +52,11 @@ def test_suggestions_are_hidden_until_approved(db):
 
     with pytest.raises(PortalError):                      # the source gave no delivery range: staff must enter one
         data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35)
+    with pytest.raises(PortalError):                      # ...and the futures month the bid hedges against
+        data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35, delivery_start="2026-12-01",
+                               delivery_end="2026-12-31")
     data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35, delivery_start="2026-12-01",
-                           delivery_end="2026-12-31")   # admin edits then approves
+                           delivery_end="2026-12-31", futures_symbol="ZCZ26")   # admin edits then approves
 
     assert data.list_bids(db, "rcm")[0]["basis_cents"] == -35
 
@@ -162,9 +165,9 @@ def test_only_tenant_staff_can_write_the_bid_board(db):
 
         with pytest.raises(PortalError):
 
-            data.publish_bid(db, "rcm", uid, grain="Corn", delivery_month="2026-12", basis_cents=-38)
+            data.publish_bid(db, "rcm", uid, grain="Corn", delivery_month="2026-12", basis_cents=-38, futures_symbol="ZCZ26")
 
-    data.publish_bid(db, "rcm", 5, grain="Corn", delivery_month="2026-12", basis_cents=-38)  # platform admin ok
+    data.publish_bid(db, "rcm", 5, grain="Corn", delivery_month="2026-12", basis_cents=-38, futures_symbol="ZCZ26")  # platform admin ok
 
     bid = data.list_bids(db, "rcm")[0]["bid_id"]
 
