@@ -55,6 +55,7 @@ def test_disclaimer_shown_at_the_bottom_of_every_page(app_db):
 # ── Massive client (placeholder, fabricated payload) ─────────────────────────
 def test_symbol_to_massive_ticker():
     assert massive.to_ticker("ZCZ26") == "ZCZ6" and massive.to_ticker("zsx27") == "ZSX7" and massive.to_ticker("KEH27") == "KEH7"
+    assert massive.to_ticker("MWEH27") is None and massive.to_ticker("ZWZ26") == "ZWZ6"      # MIAX wheat is not on the feed
     assert massive.to_ticker("ZC:BF H7") is None and massive.to_ticker("") is None and massive.to_ticker("CORN") is None
 
 

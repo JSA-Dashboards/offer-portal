@@ -5,6 +5,9 @@ API from this project, and it needs `MASSIVE_API_KEY` (the same key the River FO
 tracker use; the plan serves DELAYED snapshots). Without a key `fetch_quotes` returns nothing and the portal
 carries on with the bids as posted.
 
+Feed coverage: CBOT corn / soybeans / SRW wheat (ZC, ZS, ZW) and KC HRW wheat (KE; Massive lists it under XCBT).
+MIAX spring wheat (MWE) is not carried, so HRS bids are never priced off futures here.
+
 Shape taken from JSA's notes on the API (see the basis tracker's massive_futures.py):
   GET https://api.massive.com/futures/v1/snapshot?ticker.any_of=ZCZ6,ZSX6   Authorization: Bearer <key>
   results[] -> details.ticker ("ZCZ6", ONE-digit year), last_trade.price, session.settlement_price /
@@ -20,6 +23,7 @@ from datetime import datetime, timezone
 BASE = "https://api.massive.com/futures/v1"
 _SYMBOL = re.compile(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d{2})$")
 CHUNK = 25
+NO_FEED_ROOTS = ("MWE",)    # MIAX spring wheat: not on Massive's feed. Its bids stay as posted (flat_source 'posted').
 
 
 def configured() -> bool:
@@ -29,7 +33,9 @@ def configured() -> bool:
 def to_ticker(symbol: str) -> str | None:
     """Our two-digit-year symbol -> Massive's one-digit-year ticker: ZCZ26 -> ZCZ6. None if not an outright."""
     m = _SYMBOL.match((symbol or "").strip().upper())
-    return f"{m.group(1)}{m.group(2)}{m.group(3)[-1]}" if m else None
+    if not m or m.group(1) in NO_FEED_ROOTS:
+        return None
+    return f"{m.group(1)}{m.group(2)}{m.group(3)[-1]}"
 
 
 def _as_of(block: dict | None) -> datetime | None:
