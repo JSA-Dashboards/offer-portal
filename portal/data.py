@@ -34,6 +34,12 @@ class PortalError(ValueError):
     pass
 
 
+class PublishResult(int):
+    """publish_bid's return value: the number of flat-price offers re-priced (an int, so existing
+    callers still compare it), with `.auto_hit` = how many offers the new bid then hit automatically."""
+    auto_hit = 0
+
+
 def today_ct():
     return datetime.now(CT).date()
 
@@ -104,8 +110,8 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
                 location_id=None, futures_symbol=None, basis_cents=None, cash_price=None,
                 bushel_cap=None, expires_at=None, source_suggestion_id=None) -> int:
     """Publish a bid. It replaces the live bid for the same slot (location, grain, delivery month,
-    futures month). Returns how many outstanding flat-price offers had their implied futures
-    re-computed because the basis moved."""
+    futures month). Returns a PublishResult: how many outstanding flat-price offers had their implied
+    futures re-computed because the basis moved, and (.auto_hit) how many offers it then hit."""
     _require_staff(db, tenant_id, actor_id)
     if basis_cents is None and cash_price is None:
         raise PortalError("A bid needs a basis or a cash price.")
@@ -121,10 +127,16 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
         (tenant_id, new_id, grain, delivery_month, futures_symbol or "", location_id if location_id is not None else -1))]
     for oid in old_ids:
         db.execute("UPDATE bids SET active = FALSE WHERE bid_id = %s AND tenant_id = %s", (oid, tenant_id))
+        # Outstanding offers made against the replaced bid follow the new one (any price type), so they
+        # keep a live reference for pricing and for the hit check.
+        db.execute("UPDATE offers SET bid_id = %s WHERE tenant_id = %s AND status = 'submitted' AND bid_id = %s",
+                   (new_id, tenant_id, oid))
     _usage(db, tenant_id, "bid_published")
     _audit(db, tenant_id, actor_id, "bid_published", dict(grain=grain, delivery_month=delivery_month))
     new_bid = db.query("SELECT * FROM bids WHERE bid_id = %s AND tenant_id = %s", (new_id, tenant_id))[0]
-    return _reprice_flat_offers(db, tenant_id, new_bid, old_ids, actor_id)
+    result = PublishResult(_reprice_flat_offers(db, tenant_id, new_bid, old_ids, actor_id))
+    result.auto_hit = run_auto_hit(db, tenant_id)          # after re-pricing, so a hit locks the new implied futures
+    return result
 
 
 def stage_suggestion(db: Db, tenant_id: str, *, grain: str, delivery_month: str, source: str,
@@ -382,6 +394,8 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         detail=dict(bushels=bushels, price=price, basis_cents=basis_cents,
                     on_behalf=placed_by is not None)), ("detail",))
     _usage(db, tenant_id, "offer_submitted", oid)
+    _auto_hit_one(db, tenant_id, db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s",
+                                          (oid, tenant_id))[0], list_bids(db, tenant_id), _auto_rules(db, tenant_id))
     return oid
 
 
@@ -461,6 +475,124 @@ def expire_stale(db: Db, tenant_id: str) -> int:
     return n
 
 
+def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, rule: dict | None = None,
+              bid: dict | None = None) -> None:
+    """The one place an offer becomes hit: staff clicking Mark hit, or an auto-hit rule (rule given,
+    actor None). Writes the status, the history event, the confirmation, and the billing usage."""
+    auto = rule is not None
+    db.execute("UPDATE offers SET status = 'hit', hit_at = CURRENT_TIMESTAMP(), hit_by = %s, auto_hit = %s, "
+               "auto_hit_rule_id = %s, updated_at = CURRENT_TIMESTAMP() "
+               "WHERE offer_id = %s AND tenant_id = %s AND status = 'submitted'",
+               (actor_id, auto, rule["rule_id"] if auto else None, offer_id, tenant_id))
+    detail = {"on_behalf": False}
+    if auto:
+        detail.update(auto_hit=True, rule_id=rule["rule_id"], bid_id=bid["bid_id"],
+                      bid_basis_cents=bid["basis_cents"], bid_cash_price=bid["cash_price"])
+    _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=actor_id,
+                                     event_type="hit", detail=detail), ("detail",))
+    cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
+    _insert(db, "confirmations", dict(tenant_id=tenant_id, offer_id=offer_id, terms=cur, hit_by=actor_id,
+                                      auto_hit=auto), ("terms",))
+    _usage(db, tenant_id, "offer_hit", offer_id)
+
+
+# ── Auto-hit rules ─────────────────────────────────────────────────────────────
+def _auto_rules(db: Db, tenant_id: str) -> list[dict]:
+    return db.query("SELECT * FROM auto_hit_rules WHERE tenant_id = %s AND active ORDER BY rule_id", (tenant_id,))
+
+
+def _matching_rule(offer: dict, bid: dict, rules: list[dict]) -> dict | None:
+    loc = offer["location_id"] if offer.get("location_id") is not None else bid.get("location_id")
+    for r in rules:
+        if r["location_id"] is not None and r["location_id"] != loc:
+            continue
+        if r["grain"] and r["grain"] != offer["grain"]:
+            continue
+        if r["contract_type"] and r["contract_type"] != offer["contract_type"]:
+            continue
+        if r["max_bushels"] is not None and offer["bushels"] > r["max_bushels"]:
+            continue
+        return r
+    return None
+
+
+def _auto_hit_one(db: Db, tenant_id: str, offer: dict, bids: list[dict], rules: list[dict]) -> bool:
+    """Hit this offer if it is outstanding, the live bid has reached it, and an active rule allows it."""
+    if not rules or offer["status"] != "submitted" or offer["contract_type"] == "FUTURES_ONLY":
+        return False
+    bid = _reference_bid(offer, bids)
+    if not bid_reached(offer, bid):
+        return False
+    rule = _matching_rule(offer, bid, rules)
+    if rule is None:
+        return False
+    _mark_hit(db, tenant_id, offer["offer_id"], rule=rule, bid=bid)
+    return True
+
+
+def run_auto_hit(db: Db, tenant_id: str) -> int:
+    """Check every outstanding offer against the live bids and the tenant's active auto-hit rules.
+    Safe to call any time (idempotent). Runs when a bid is posted, an offer is entered, a rule is
+    added or switched on, and from the admin's 'check now' button. Returns how many offers it hit."""
+    rules = _auto_rules(db, tenant_id)
+    if not rules:
+        return 0
+    expire_stale(db, tenant_id)                                  # a lapsed offer is expired, never hit
+    bids = list_bids(db, tenant_id)
+    return sum(_auto_hit_one(db, tenant_id, o, bids, rules)
+               for o in db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'submitted'", (tenant_id,)))
+
+
+def list_auto_hit_rules(db: Db, tenant_id: str, admin_id: int) -> list[dict]:
+    _require_admin(db, tenant_id, admin_id)
+    return db.query("SELECT * FROM auto_hit_rules WHERE tenant_id = %s ORDER BY rule_id", (tenant_id,))
+
+
+def add_auto_hit_rule(db: Db, tenant_id: str, admin_id: int, *, location_id=None, grain=None,
+                      contract_type=None, max_bushels=None) -> int:
+    """Admin adds a rule and it is applied at once. Returns how many outstanding offers it hit."""
+    _require_admin(db, tenant_id, admin_id)
+    if grain and grain not in CONTRACT_BUSHELS:
+        raise PortalError("Unknown commodity.")
+    if contract_type and contract_type not in ("CASH", "HTA"):
+        raise PortalError("Auto-hit applies to cash and HTA offers (futures-only offers have no bid to reach).")
+    if location_id is not None and not db.query(
+            "SELECT 1 AS x FROM locations WHERE location_id = %s AND tenant_id = %s", (location_id, tenant_id)):
+        raise PortalError("Unknown location.")
+    if max_bushels is not None and max_bushels <= 0:
+        raise PortalError("The bushel limit must be positive (leave it blank for no limit).")
+    _insert(db, "auto_hit_rules", dict(tenant_id=tenant_id, location_id=location_id, grain=grain or None,
+                                       contract_type=contract_type or None, max_bushels=max_bushels,
+                                       created_by=admin_id))
+    _audit(db, tenant_id, admin_id, "auto_hit_rule_added", dict(location_id=location_id, grain=grain,
+                                                                contract_type=contract_type, max_bushels=max_bushels))
+    return run_auto_hit(db, tenant_id)
+
+
+def set_auto_hit_rule_active(db: Db, tenant_id: str, admin_id: int, rule_id: int, active: bool) -> int:
+    _require_admin(db, tenant_id, admin_id)
+    if not db.query("SELECT 1 AS x FROM auto_hit_rules WHERE rule_id = %s AND tenant_id = %s", (rule_id, tenant_id)):
+        raise PortalError("Rule not found for this tenant.")
+    db.execute("UPDATE auto_hit_rules SET active = %s WHERE rule_id = %s AND tenant_id = %s",
+               (active, rule_id, tenant_id))
+    _audit(db, tenant_id, admin_id, "auto_hit_rule_on" if active else "auto_hit_rule_off", dict(rule_id=rule_id))
+    return run_auto_hit(db, tenant_id) if active else 0
+
+
+def check_auto_hit_now(db: Db, tenant_id: str, admin_id: int) -> int:
+    _require_admin(db, tenant_id, admin_id)
+    return run_auto_hit(db, tenant_id)
+
+
+def list_auto_hits(db: Db, tenant_id: str, admin_id: int, limit: int = 25) -> list[dict]:
+    """Recent offers hit automatically, newest first."""
+    _require_admin(db, tenant_id, admin_id)
+    viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
+    rows = [o for o in list_offers(db, tenant_id, viewer) if o["auto_hit"]]
+    rows.sort(key=lambda o: str(o["hit_at"]), reverse=True)
+    return rows[:limit]
+
+
 def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
                  on_behalf: bool = False) -> str:
     """hit | decline | withdraw. Returns the new status. There are no counter-offers.
@@ -488,16 +620,14 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
     acting_role = "farmer" if on_behalf else user["role"]
     if acting_role not in roles:
         raise PortalError(f"A {acting_role} cannot {action} this offer.")
+    if new_status == "hit":
+        _mark_hit(db, tenant_id, offer_id, actor_id=user["user_id"])
+        return new_status
     db.execute("UPDATE offers SET status = %s, updated_at = CURRENT_TIMESTAMP() "
                "WHERE offer_id = %s AND tenant_id = %s", (new_status, offer_id, tenant_id))
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=user["user_id"],
                                      event_type=new_status, detail={"on_behalf": on_behalf}),
             ("detail",))
-    if new_status == "hit":
-        cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
-        _insert(db, "confirmations", dict(tenant_id=tenant_id, offer_id=offer_id, terms=cur,
-                                          accepted_by=user["user_id"]), ("terms",))
-        _usage(db, tenant_id, "offer_hit", offer_id)
     return new_status
 
 

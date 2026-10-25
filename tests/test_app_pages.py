@@ -122,3 +122,62 @@ def data_month():
     """The bid form's first delivery-month option is the current month."""
     from datetime import date
     return date.today().strftime("%Y-%m")
+
+
+# ── auto-hit page ────────────────────────────────────────────────────────────
+def _reached_offer(db):
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", futures_symbol="ZCZ26",
+                     basis_cents=-38, cash_price=4.50)
+    return data.create_offer(db, "rcm", conftest.user(db, 1), **FLAT, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+
+
+def test_auto_hit_page_is_admin_only(app_db):
+    assert "Auto-hit" in _views(_as(app_db, 2))
+    app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
+    assert "Auto-hit" not in _views(_as(app_db, 20))
+    assert "Auto-hit" not in _views(_as(app_db, 1))
+
+
+def test_adding_a_rule_hits_offers_the_bid_already_reached(app_db):
+    oid = _reached_offer(app_db)
+    at = _go(_as(app_db, 2), "Auto-hit")
+    assert any("No rules yet" in i.value for i in at.info)
+    next(b for b in at.button if b.label == "Add rule").click().run()               # default = any scope, no size limit
+    assert not at.exception, at.exception
+    assert not at.error, [e.value for e in at.error]
+    assert any("Rule added. 1 outstanding offer" in s.value for s in at.success)
+    o = [x for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 2)) if x["offer_id"] == oid][0]
+    assert (o["status"], o["auto_hit"]) == ("hit", 1)
+    assert at.dataframe and list(at.dataframe[0].value["Bushels"]) == [5000]          # listed under "recently hit"
+    at.radio[0].set_value("Offers").run()
+    at.radio[1].set_value("Hit").run()
+    assert any("Hit automatically" in c.value for c in at.caption)
+
+
+def test_rule_toggle_and_check_now(app_db):
+    data.add_auto_hit_rule(app_db, "rcm", 2, max_bushels=1000)                        # too small to cover a 5,000 bu offer
+    oid = _reached_offer(app_db)
+    at = _go(_as(app_db, 2), "Auto-hit")
+    assert any("up to 1,000 bu per offer" in m.value for m in at.markdown)
+    next(b for b in at.button if b.label == "Check outstanding offers now").click().run()
+    assert any("Checked. 0 offers hit." in s.value for s in at.success)
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
+
+
+def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
+    data.add_auto_hit_rule(app_db, "rcm", 2)
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol="ZCZ26",
+                     location_id=1, basis_cents=-38, cash_price=4.18)
+    oid = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT,
+                            bid_id=data.list_bids(app_db, "rcm")[0]["bid_id"])           # 4.30 > bid 4.18: outstanding
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
+    at = _go(_as(app_db, 2), "Bid board")
+    next(t for t in at.text_input if t.label == "Futures symbol").set_value("zcz26")
+    next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
+    next(n for n in at.number_input if n.label.startswith("Cash")).set_value(4.35)
+    next(s for s in at.selectbox if s.label == "Delivery month").set_value(data_month())
+    next(b for b in at.button if b.label == "Post bid").click().run()
+    assert not at.exception, at.exception
+    assert not at.error, [e.value for e in at.error]
+    assert any("1 offer was hit automatically" in s.value for s in at.success)
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"

@@ -179,6 +179,10 @@ CREATE TABLE IF NOT EXISTS offers (
     contract_ref   STRING,                          -- contract reference number (required to complete an offer)
     basis_ref_cents NUMBER(38,0),                   -- flat-price offers: the posted basis the implied futures uses
     implied_futures FLOAT,                          -- flat price minus that basis; re-computed when the basis moves
+    hit_at         TIMESTAMP_TZ,
+    hit_by         NUMBER(38,0),                    -- NULL when hit automatically
+    auto_hit       BOOLEAN      NOT NULL DEFAULT FALSE,
+    auto_hit_rule_id NUMBER(38,0),                  -- the rule that fired
     completed_at   TIMESTAMP_TZ,
     completed_by   NUMBER(38,0),
     hedged_at      TIMESTAMP_TZ,                    -- set when staff mark a hit offer as hedged
@@ -196,21 +200,22 @@ CREATE TABLE IF NOT EXISTS offer_events (
     event_id       NUMBER(38,0) IDENTITY(1,1),
     tenant_id      STRING       NOT NULL,
     offer_id       NUMBER(38,0) NOT NULL,
-    actor_user_id  NUMBER(38,0),                    -- NULL = system (expiry job, auto-accept)
+    actor_user_id  NUMBER(38,0),                    -- NULL = system (expiry job, auto-hit)
     event_type     STRING       NOT NULL,           -- submitted | hit | completed | hedged | basis_updated | declined | withdrawn | expired | details_updated
     detail         VARIANT,                         -- terms at that moment
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (event_id)
 );
 
--- Elevator-set rules: accept automatically when the offer meets them.
-CREATE TABLE IF NOT EXISTS auto_accept_rules (
+-- Elevator-admin rules: mark an outstanding offer HIT automatically when the posted bid reaches it.
+-- No active rules = nothing is ever auto-hit. NULL scope columns mean "any". Offers bigger than
+-- max_bushels are left for staff to review. Flat-price offers need the bid to carry a cash price.
+CREATE TABLE IF NOT EXISTS auto_hit_rules (
     rule_id        NUMBER(38,0) IDENTITY(1,1),
     tenant_id      STRING       NOT NULL,
     location_id    NUMBER(38,0),
     grain          STRING,
-    min_basis_cents NUMBER(38,0),                   -- accept if offered basis >= this
-    min_price      FLOAT,                           -- or if fixed price >= this
+    contract_type  STRING,                          -- CASH | HTA (futures-only offers have no bid to reach)
     max_bushels    NUMBER(38,0),
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
     created_by     NUMBER(38,0),
@@ -218,14 +223,14 @@ CREATE TABLE IF NOT EXISTS auto_accept_rules (
     PRIMARY KEY (rule_id)
 );
 
--- Accepted terms. hedge_ticket_id is reserved for phase 2 (QST bridge).
+-- Terms agreed when an offer was hit. hedge_ticket_id is reserved for phase 2 (QST bridge).
 CREATE TABLE IF NOT EXISTS confirmations (
     confirmation_id NUMBER(38,0) IDENTITY(1,1),
     tenant_id      STRING       NOT NULL,
     offer_id       NUMBER(38,0) NOT NULL,
     terms          VARIANT      NOT NULL,
-    accepted_by    NUMBER(38,0),
-    auto_accepted  BOOLEAN      NOT NULL DEFAULT FALSE,
+    hit_by         NUMBER(38,0),                    -- NULL when hit automatically
+    auto_hit       BOOLEAN      NOT NULL DEFAULT FALSE,
     hedge_ticket_id NUMBER(38,0),
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (confirmation_id)

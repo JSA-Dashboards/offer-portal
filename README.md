@@ -11,6 +11,8 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
   (completing requires a contract number and archives the offer), or Declined / Withdrawn / Expired.
   There are no counter-offers.
 - **Summary:** offers by commodity and delivery period, filterable by entity, individual, commodity, period.
+- **Auto-hit (admin only):** rules that mark an outstanding offer hit automatically when the posted bid reaches it
+  (scope by location, commodity, contract type, largest offer). No active rules = never automatic.
 - **Hedge (admin only):** contracts to hedge and at what prices (implied futures / basis), by futures month.
 - **Farmers:** customer records (client ID, entity, individual) that exist with or without a portal login.
 - **Platform console (JSA):** create tenants, branding, locations, scrape sources, usage report for billing.
@@ -38,4 +40,4 @@ Settings (env or Streamlit secrets): `SNOWFLAKE_ACCOUNT/USER/ROLE/WAREHOUSE/DATA
 (local only: shows sign-in codes on screen).
 
 ## Not built yet
-Auto-accept / auto-hit rules, scraper schedule on the droplet, QST hedge bridge (phase 2).
+Scraper schedule on the droplet, QST hedge bridge (phase 2).

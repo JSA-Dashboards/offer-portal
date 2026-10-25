@@ -118,9 +118,13 @@ def _loc_names(db, tenant_id: str) -> dict:
 
 
 def _repriced_msg(n: int) -> str:
-    return ("Bid posted." if not n else
-            f"Bid posted. {n} outstanding flat-price offer{'s' if n != 1 else ''} had the implied futures "
-            "price recalculated for the new basis.")
+    msg = "Bid posted."
+    if n:
+        msg += (f" {int(n)} outstanding flat-price offer{'s' if n != 1 else ''} had the implied futures "
+                "price recalculated for the new basis.")
+    if hit := getattr(n, "auto_hit", 0):
+        msg += f" {hit} offer{'s were' if hit != 1 else ' was'} hit automatically."
+    return msg
 
 
 def _bid_rows(bids: list[dict], locs: dict) -> list[dict]:
@@ -303,6 +307,8 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
             st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
         meta = [x for x in (f"Delivery {o['delivery_start']} → {o['delivery_end']}" if o["delivery_start"] else "",
                             f"Good until {str(o['expires_at'])[:10]}" if o["expires_at"] else "",
+                            (f"Hit automatically {str(o['hit_at'])[:10]}" if o.get("auto_hit") else
+                             f"Hit {str(o['hit_at'])[:10]}") if o.get("hit_at") else "",
                             f"Completed {str(o['completed_at'])[:10]}" if o.get("completed_at") else "",
                             f"Contract # {o['contract_ref']}" if o.get("contract_ref") else "",
                             o["note"] or "") if x]
@@ -779,6 +785,75 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
                "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")
 
 
+def _rule_text(r: dict, locs: dict) -> str:
+    scope = [locs.get(r["location_id"], "unknown location") if r["location_id"] is not None else "any location",
+             r["grain"] or "any commodity", r["contract_type"] or "cash and HTA"]
+    return " · ".join(scope) + (f" · up to {r['max_bushels']:,} bu per offer" if r["max_bushels"] else " · any size")
+
+
+@st.fragment
+def auto_hit_view(db, tenant_id: str, user: dict) -> None:
+    """Admin only: rules that mark an outstanding offer hit when the posted bid reaches it."""
+    if user["role"] not in ("elevator_admin", "platform_admin"):
+        st.error("This page is for elevator admins.")
+        return
+    uid = user["user_id"]
+    if msg := st.session_state.pop("auto_hit_msg", None):
+        st.success(msg)
+    st.caption("When the posted bid reaches an outstanding offer, it is marked hit automatically if an active rule "
+               "covers it. With no active rules nothing is ever hit automatically. A hit offer is executed on the "
+               "farmer's own terms; the bid that triggered it is saved in the offer's history. Offers outside every "
+               "rule (for example, larger than a rule's size limit) stay outstanding with a \"bid has reached\" flag "
+               "for staff. Flat-price offers need the bid to carry a cash price.")
+    locs = _loc_names(db, tenant_id)
+    rules = data.list_auto_hit_rules(db, tenant_id, uid)
+    st.subheader("Rules")
+    if not rules:
+        st.info("No rules yet. Offers are only hit when staff mark them.")
+    for r in rules:
+        with st.container(border=True, horizontal=True, vertical_alignment="center"):
+            st.markdown(_rule_text(r, locs))
+            on = st.toggle("Active", bool(r["active"]), key=f"ahr_{r['rule_id']}")
+            if on != bool(r["active"]):
+                n = data.set_auto_hit_rule_active(db, tenant_id, uid, r["rule_id"], on)
+                st.session_state["auto_hit_msg"] = (f"Rule switched on. {n} outstanding offer{'s' if n != 1 else ''} "
+                                                    "hit." if on else "Rule switched off.")
+                _refresh()
+    with st.expander("Add a rule", expanded=not rules):
+        with st.form("auto_hit_rule", clear_on_submit=True):
+            c1, c2, c3, c4 = st.columns(4)
+            loc = c1.selectbox("Location", [None] + list(locs), format_func=lambda x: "Any location" if x is None else locs[x])
+            grain = c2.selectbox("Commodity", [None] + list(GRAINS), format_func=lambda x: x or "Any commodity")
+            ctype = c3.selectbox("Contract type", [None, "CASH", "HTA"], format_func=lambda x: x or "Cash and HTA")
+            cap = c4.number_input("Largest offer (bu), blank = no limit", value=None, min_value=0, step=1000, format="%d")
+            if st.form_submit_button("Add rule", type="primary"):
+                try:
+                    n = data.add_auto_hit_rule(db, tenant_id, uid, location_id=loc, grain=grain, contract_type=ctype,
+                                               max_bushels=int(cap) if cap else None)
+                    st.session_state["auto_hit_msg"] = (f"Rule added. {n} outstanding offer{'s' if n != 1 else ''} "
+                                                        "already reached by the bid were hit.")
+                    _refresh()
+                except data.PortalError as e:
+                    st.error(str(e))
+    if st.button("Check outstanding offers now", key="auto_hit_now"):
+        n = data.check_auto_hit_now(db, tenant_id, uid)
+        st.session_state["auto_hit_msg"] = f"Checked. {n} offer{'s' if n != 1 else ''} hit."
+        _refresh()
+    st.subheader("Recently hit automatically")
+    recent = data.list_auto_hits(db, tenant_id, uid)
+    if not recent:
+        st.info("Nothing has been hit automatically yet.")
+    else:
+        st.dataframe([{"Hit": str(o["hit_at"])[:16], "Farmer": o["farmer_name"], "Client ID": o["farmer_client_id"] or "",
+                       "Commodity": o["grain"], "Futures month": o["futures_symbol"], "Bushels": o["bushels"],
+                       "Price": o["price"] if o["price_type"] == "FIXED" else None,
+                       "Basis (¢)": o["basis_cents"] if o["price_type"] == "BASIS" else None,
+                       "Stage": data.STATUS_LABELS.get(o["status"], o["status"]), "Rule": o["auto_hit_rule_id"]}
+                      for o in recent], hide_index=True, width="stretch",
+                     column_config={"Bushels": st.column_config.NumberColumn(format="%d"),
+                                    "Price": st.column_config.NumberColumn(format="$%.4f")})
+
+
 def main() -> None:
     try:
         db = get_db()
@@ -813,7 +888,7 @@ def main() -> None:
     staff = user["role"] in data.ELEVATOR_ROLES or user["role"] == "platform_admin"
     tid = tenant["tenant_id"]
     admin = user["role"] in ("elevator_admin", "platform_admin")
-    views = (["Offers", "Summary"] + (["Hedge"] if admin else []) +
+    views = (["Offers", "Summary"] + (["Hedge", "Auto-hit"] if admin else []) +
              ["Place offer", "Farmers", "Bid board", "Review scraped bids", "People"] if staff
              else ["Bid board", "Make an offer", "My offers"])
     if user["role"] == "platform_admin":
@@ -825,6 +900,8 @@ def main() -> None:
         summary_view(db, tid, user)
     elif view == "Hedge":
         hedge_view(db, tid, user)
+    elif view == "Auto-hit":
+        auto_hit_view(db, tid, user)
     elif view == "People":
         people_view(db, tenant, user)
     elif view == "Place offer":

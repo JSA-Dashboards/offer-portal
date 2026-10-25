@@ -5,6 +5,9 @@ from portal.db import Db
 # Test-only sqlite mirror of the columns data.py touches (production is Snowflake).
 DDL = """
 CREATE TABLE login_codes (email TEXT, code_hash TEXT, expires_at TEXT, used INT DEFAULT 0, attempts INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE auto_hit_rules (rule_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT,
+  grain TEXT, contract_type TEXT, max_bushels INT, active INT DEFAULT 1, created_by INT,
+  created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE scrape_sources (source_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, url TEXT,
   location_name TEXT, active INT DEFAULT 1, last_run_at TEXT, last_status TEXT);
 CREATE TABLE farmers (farmer_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, client_id TEXT, entity_name TEXT,
@@ -26,12 +29,13 @@ CREATE TABLE bids (bid_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, 
 CREATE TABLE offers (offer_id INTEGER PRIMARY KEY, tenant_id TEXT, farmer_id INT, farmer_user_id INT, placed_by INT, location_id INT, bid_id INT,
   grain TEXT, contract_type TEXT, price_type TEXT, bushels INT, price REAL, basis_cents INT, futures_symbol TEXT,
   delivery_start TEXT, delivery_end TEXT, note TEXT, contract_ref TEXT, basis_ref_cents INT, implied_futures REAL,
+  hit_at TEXT, hit_by INT, auto_hit INT DEFAULT 0, auto_hit_rule_id INT,
   completed_at TEXT, completed_by INT, hedged_at TEXT, hedged_by INT, bid_snapshot TEXT, status TEXT, expires_at TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE offer_events (event_id INTEGER PRIMARY KEY, tenant_id TEXT, offer_id INT, actor_user_id INT,
   event_type TEXT, detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE confirmations (confirmation_id INTEGER PRIMARY KEY, tenant_id TEXT, offer_id INT, terms TEXT,
-  accepted_by INT, auto_accepted INT DEFAULT 0, hedge_ticket_id INT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+  hit_by INT, auto_hit INT DEFAULT 0, hedge_ticket_id INT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE audit_log (audit_id INTEGER PRIMARY KEY, tenant_id TEXT, actor_user_id INT, action TEXT,
   detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE usage_events (usage_id INTEGER PRIMARY KEY, tenant_id TEXT, event_type TEXT, quantity INT DEFAULT 1,

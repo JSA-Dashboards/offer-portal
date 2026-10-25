@@ -258,3 +258,17 @@ def test_marking_offers_hedged_removes_them_from_the_to_hedge_list(db):
     assert [o["offer_id"] for o in h["now_offers"]] == [b] and h["now_totals"][0]["bushels"] == 5000
     assert _offers(db)[a]["hedged_by"] == 2
     assert "hedged" in {r["event_type"] for r in db.query("SELECT event_type FROM offer_events WHERE offer_id = %s", (a,))}
+
+
+def test_outstanding_offers_of_every_type_follow_a_replaced_bid(db):
+    _bid(db, basis=-38)
+    first = _live_bid(db)
+    flat = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=first)
+    hta = data.create_offer(db, "rcm", user(db, 1), **HTA, bid_id=first)
+    hit = data.create_offer(db, "rcm", user(db, 1), **HTA, bid_id=first)
+    data.act_on_offer(db, "rcm", user(db, 2), hit, "hit")
+    _bid(db, basis=-30)
+    new = _live_bid(db)
+    o = _offers(db)
+    assert new != first and o[flat]["bid_id"] == new and o[hta]["bid_id"] == new   # still priced off a live bid
+    assert o[hit]["bid_id"] == first                                                 # a hit offer keeps the bid it was hit on
