@@ -4,11 +4,12 @@
 `bid_suggestions` staging table. It never publishes a bid; elevator admins confirm each one in the portal.
 The Droplet runs only this job (no Streamlit), from a git clone at `/opt/offer-portal`, like the other apps.
 
-## State on 2026-10-25
-Installed and idle: clone, `.venv`, `.env`, the Snowflake key, and the cron line **commented out**.
-It must stay off until the Snowflake side exists, otherwise every run fails and pages `cron-alert`.
+## State
+**Live since 2026-10-25.** Snowflake scripts 00-03 were run, the smoke test staged RCM (16) and Dorans (8) bids as
+`OFFER_PORTAL_SVC`, nothing was published, and the cron line is active (weekdays 06:15 and 12:15 CT). If the
+database is ever rebuilt, comment the line out first or every run fails and pages `cron-alert`.
 
-## Turn it on (after the Snowflake scripts are run)
+## Setup record (already done)
 1. In Snowsight, as ACCOUNTADMIN, run `sql/00_database.sql`, `01_schema.sql`, `02_seed.sql`.
 2. Paste the public key printed in step 3 below into `sql/03_service_user.sql` and run it.
 3. Public key (safe to share; the private half never leaves the box):

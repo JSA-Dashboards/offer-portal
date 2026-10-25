@@ -41,6 +41,7 @@ def run(db, only_tenant: str | None = None, fetch=scrapers.fetch_source) -> dict
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("snowflake").setLevel(logging.WARNING)     # the connector logs every HTTP call at INFO
     out = run(connect(), sys.argv[1] if len(sys.argv) > 1 else None)
     for k, v in out.items():
         print(k, v)
