@@ -13,9 +13,9 @@ database is ever rebuilt, comment the line out first or every run fails and page
 1. In Snowsight, as ACCOUNTADMIN, run `sql/00_database.sql`, `01_schema.sql`, `02_seed.sql`.
 2. Paste the public key printed in step 3 below into `sql/03_service_user.sql` and run it.
 3. Public key (safe to share; the private half never leaves the box):
-   `ssh root@137.184.195.51 "openssl pkey -in /opt/offer-portal/offer_portal_svc.p8 -pubout | sed '1d;\$d' | tr -d '\n'; echo"`
+   `ssh root@<droplet> "openssl pkey -in /opt/offer-portal/offer_portal_svc.p8 -pubout | sed '1d;\$d' | tr -d '\n'; echo"`
 4. Smoke test once by hand, then check the log:
-   `ssh root@137.184.195.51 /opt/offer-portal/deploy/run_scrape.sh && tail -n 20 /opt/offer-portal/logs/scrape_*.log`
+   `ssh root@<droplet> /opt/offer-portal/deploy/run_scrape.sh && tail -n 20 /opt/offer-portal/logs/scrape_*.log`
    Expect `ok staged=... unchanged=... unmatched=0` for `rcm` and `dorans`. `unmatched` > 0 means a feed
    location name does not match a row in `locations`.
 5. Uncomment the crontab line (`crontab -e`; back it up first to `/opt/alerting/crontab.backup.<date>`):
