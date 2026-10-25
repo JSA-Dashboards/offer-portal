@@ -1,0 +1,124 @@
+from portal import data, farmers
+from test_app import _as, app_db  # noqa: F401  (fixture + signed-in session helper)
+import conftest
+
+FLAT = dict(grain="Corn", contract_type="CASH", price_type="FIXED", bushels=5000, price=4.30, futures_symbol="ZCZ26")
+
+
+def _views(at):
+    return list(at.radio[0].options)
+
+
+def _go(at, view):
+    at.radio[0].set_value(view).run()
+    assert not at.exception, at.exception
+    return at
+
+
+def _hit_offer(db):
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", futures_symbol="ZCZ26",
+                     basis_cents=-38, cash_price=4.18)
+    oid = data.create_offer(db, "rcm", conftest.user(db, 1), **FLAT, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+    data.act_on_offer(db, "rcm", conftest.user(db, 2), oid, "hit")
+    return oid
+
+
+def test_navigation_by_role(app_db):
+    assert _views(_as(app_db, 2))[:3] == ["Offers", "Summary", "Hedge"]                 # elevator admin
+    app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
+    staff = _views(_as(app_db, 20))
+    assert "Summary" in staff and "Hedge" not in staff                                   # staff don't get the hedge page
+    farmer = _views(_as(app_db, 1))
+    assert not {"Summary", "Hedge", "Farmers", "Place offer"} & set(farmer)
+
+
+def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app_db):
+    _hit_offer(app_db)
+    data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT)
+    at = _as(app_db, 2)
+    assert list(at.radio[1].options) == ["Outstanding (1)", "Hit (1)", "Completed (0)", "Closed (0)"]
+    assert any("5,000 bu Corn" in m.value for m in at.markdown)
+    assert any(b.label == "Mark hit" for b in at.button)                                  # outstanding stage
+    at.radio[1].set_value("Hit").run()
+    assert not at.exception, at.exception
+    assert any(b.label == "Complete and archive" for b in at.button)                      # hit stage
+
+
+def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
+    oid = _hit_offer(app_db)
+    at = _as(app_db, 2)
+    at.radio[1].set_value("Hit").run()
+    assert any("implied futures 4.6800" in m.value for m in at.markdown)
+    next(b for b in at.button if b.label == "Complete and archive").click().run()
+    assert at.error and "contract number" in at.error[0].value.lower()
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
+    next(t for t in at.text_input if t.label.startswith("Contract number")).set_value("C-5531")
+    next(b for b in at.button if b.label == "Complete and archive").click().run()
+    assert not at.exception, at.exception
+    o = data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]
+    assert (o["offer_id"], o["status"], o["contract_ref"]) == (oid, "completed", "C-5531")
+    at.radio[1].set_value("Completed").run()
+    assert any("Contract # C-5531" in c.value for c in at.caption)
+    assert not any(b.label == "Complete and archive" for b in at.button)                  # archived: read-only
+
+
+def test_summary_page_filters_by_commodity_period_entity_and_individual(app_db):
+    pat = farmers.create_farmer(app_db, "rcm", 2, "Pat Farmer", entity_name="Farmer Bros LLC", client_id="1")
+    joe = farmers.create_farmer(app_db, "rcm", 2, "Joe Solo", entity_name="Smith Farms", client_id="2")
+    data.place_offer_for_farmer(app_db, "rcm", 2, pat, **FLAT, delivery_start="2026-12-05")
+    data.place_offer_for_farmer(app_db, "rcm", 2, joe, **{**FLAT, "grain": "Soybeans", "futures_symbol": "ZSX26"},
+                                delivery_start="2027-01-10")
+    at = _go(_as(app_db, 2), "Summary")
+    assert {m.label: m.value for m in at.metric} == {"Offers": "2", "Bushels": "10,000"}
+    assert at.dataframe
+    {m.label: m for m in at.multiselect}["Commodity"].set_value(["Soybeans"]).run()
+    assert {m.label: m.value for m in at.metric}["Offers"] == "1"
+    {m.label: m for m in at.multiselect}["Commodity"].set_value([]).run()
+    {t.label: t for t in at.text_input}["Entity name contains"].set_value("farmer bros").run()
+    assert {m.label: m.value for m in at.metric}["Offers"] == "1"
+    {t.label: t for t in at.text_input}["Entity name contains"].set_value("").run()
+    {t.label: t for t in at.text_input}["Individual name contains"].set_value("joe").run()
+    assert {m.label: m.value for m in at.metric}["Offers"] == "1"
+    {t.label: t for t in at.text_input}["Individual name contains"].set_value("nobody").run()
+    assert any("No offers match" in i.value for i in at.info)
+
+
+def test_hedge_page_shows_contracts_and_marks_offers_hedged(app_db):
+    oid = _hit_offer(app_db)
+    data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **{**FLAT, "bushels": 10000, "price": 4.60})
+    at = _go(_as(app_db, 2), "Hedge")
+    assert len(at.dataframe) >= 4                                                          # now + potential, 2 tables each
+    assert any("implied futures" in c.value for c in at.caption)
+    now_totals = at.dataframe[0].value
+    assert list(now_totals["Contracts"]) == [1.0] and list(now_totals["Bushels"]) == [5000]
+    {m.label: m for m in at.multiselect}["Hit offers not yet hedged"].select(
+        data.hedge_summary(app_db, "rcm", 2)["now_offers"][0]).run()
+    next(b for b in at.button if b.label == "Mark selected as hedged").click().run()
+    assert not at.exception, at.exception
+    assert [o["hedged_at"] is not None for o in data.list_offers(app_db, "rcm", conftest.user(app_db, 2))
+            if o["offer_id"] == oid] == [True]
+    assert any("No hit offers are waiting" in i.value for i in at.info)
+
+
+def test_posting_a_bid_reports_how_many_flat_offers_were_repriced(app_db):
+    # The form posts for the first location (id 1), so the live bid must be that location's slot.
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol="ZCZ26",
+                     location_id=1, basis_cents=-38, cash_price=4.18)
+    bid = data.list_bids(app_db, "rcm")[0]["bid_id"]
+    hit = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
+    data.act_on_offer(app_db, "rcm", conftest.user(app_db, 2), hit, "hit")                 # locked, not repriced
+    data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
+    at = _go(_as(app_db, 2), "Bid board")
+    next(t for t in at.text_input if t.label == "Futures symbol").set_value("zcz26")
+    next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
+    next(s for s in at.selectbox if s.label == "Delivery month").set_value(data_month())
+    next(b for b in at.button if b.label == "Post bid").click().run()
+    assert not at.exception, at.exception
+    assert not at.error, [e.value for e in at.error]
+    assert any("1 outstanding flat-price offer" in s.value for s in at.success)
+
+
+def data_month():
+    """The bid form's first delivery-month option is the current month."""
+    from datetime import date
+    return date.today().strftime("%Y-%m")

@@ -1,0 +1,844 @@
+"""Offer Portal — white-label grain offer manager. One app; the tenant comes from ?t=<slug>.
+
+Elevator staff manage the bid board (and confirm scraped bids); farmers see their
+elevator's published bids. Offers screens are the next build step.
+"""
+from __future__ import annotations
+
+import html
+import os
+import re
+from datetime import date
+
+import streamlit as st
+
+# Streamlit Cloud secrets -> env, so portal/* (which reads os.environ) works unchanged.
+try:
+    for _k in st.secrets:
+        if isinstance(st.secrets[_k], str) and not os.environ.get(_k):
+            os.environ[_k] = st.secrets[_k]
+except Exception:
+    pass
+
+import scrape_run
+from portal import auth, data, farmers, people, platform
+from portal.db import connect
+
+GRAINS = ("Corn", "Soybeans", "Wheat")
+DEV = os.environ.get("OFFER_PORTAL_DEV") == "1"
+
+st.set_page_config(page_title="Offer portal", page_icon=":material/grain:", layout="wide")
+
+
+@st.cache_resource
+def get_db():
+    return connect()
+
+
+def _months(n: int = 24) -> list[str]:
+    t, out = date.today(), []
+    y, m = t.year, t.month
+    for _ in range(n):
+        out.append(f"{y}-{m:02d}")
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return out
+
+
+def _brand(tenant: dict) -> None:
+    """Per-tenant look: the one place we inject CSS (white-label accent only)."""
+    color = tenant.get("primary_color") or "#32373c"
+    accent = tenant.get("accent_color") or "#0693e3"
+    if not (re.fullmatch(r"#[0-9a-fA-F]{6}", color) and re.fullmatch(r"#[0-9a-fA-F]{6}", accent)):
+        color, accent = "#32373c", "#0693e3"
+    st.html(f"<style>h1,h2,h3{{color:{color}}} .stButton>button[kind='primary']"
+            f"{{background:{accent};border-color:{accent}}}</style>")
+    if tenant.get("logo_url"):
+        st.logo(tenant["logo_url"])
+
+
+def _send_code(tenant: dict):
+    def send(email: str, code: str) -> None:
+        if auth.graph_configured():
+            auth.send_via_graph(
+                email, f"Your {tenant['name']} sign-in code",
+                f"<p>Your sign-in code is <b>{code}</b>. It expires in 10 minutes.</p>")
+        elif DEV:
+            st.session_state["_dev_code"] = code          # local development only
+        else:
+            raise RuntimeError("Email is not configured.")
+    return send
+
+
+def login_view(db, tenant: dict) -> None:
+    st.title(tenant["name"])
+    st.caption("Sign in with your email — we'll send you a one-time code.")
+    step = st.session_state.get("login_step", "email")
+    if step == "email":
+        with st.form("email_form"):
+            email = st.text_input("Email")
+            go = st.form_submit_button("Send code", type="primary")
+        if go:
+            try:
+                auth.request_code(db, email, tenant["tenant_id"], _send_code(tenant))
+            except Exception:
+                st.error("We couldn't send the code. Please try again shortly.")
+                return
+            st.session_state.update(login_step="code", login_email=email.strip().lower())
+            st.rerun()
+    else:
+        st.info("If that email is registered with this elevator, a code is on its way.")
+        if DEV and st.session_state.get("_dev_code"):
+            st.warning(f"Dev mode code: {st.session_state['_dev_code']}")
+        with st.form("code_form"):
+            code = st.text_input("6-digit code")
+            go = st.form_submit_button("Sign in", type="primary")
+        if go:
+            u = auth.verify_code(db, st.session_state["login_email"], code, tenant["tenant_id"])
+            if u:
+                st.session_state.update(user=u, tenant_id=tenant["tenant_id"])
+                st.session_state.pop("login_step", None)
+                st.session_state.pop("_dev_code", None)
+                st.rerun()
+            st.error("That code didn't work. Check it, or request a new one.")
+        if st.button("Use a different email"):
+            st.session_state.pop("login_step", None)
+            st.rerun()
+
+
+def _refresh() -> None:
+    """Rerun just the calling fragment; a full rerun when not in a fragment run (e.g. AppTest)."""
+    try:
+        st.rerun(scope="fragment")
+    except st.errors.StreamlitAPIException:
+        st.rerun()
+
+
+def _loc_names(db, tenant_id: str) -> dict:
+    return {l["location_id"]: l["name"] for l in data.list_locations(db, tenant_id)}
+
+
+def _repriced_msg(n: int) -> str:
+    return ("Bid posted." if not n else
+            f"Bid posted. {n} outstanding flat-price offer{'s' if n != 1 else ''} had the implied futures "
+            "price recalculated for the new basis.")
+
+
+def _bid_rows(bids: list[dict], locs: dict) -> list[dict]:
+    return [{"Location": locs.get(b["location_id"], "—"), "Grain": b["grain"],
+             "Delivery": b["delivery_month"], "Futures": b["futures_symbol"] or "",
+             "Basis (¢)": b["basis_cents"], "Cash ($/bu)": b["cash_price"],
+             "Bushel cap": b["bushel_cap"]} for b in bids]
+
+
+@st.fragment
+def published_view(db, tenant_id: str, user: dict, editable: bool) -> None:
+    if msg := st.session_state.pop("bid_msg", None):
+        st.success(msg)
+    locs = _loc_names(db, tenant_id)
+    bids = data.list_bids(db, tenant_id)
+    if not bids:
+        st.info("No bids are posted right now.")
+    else:
+        st.dataframe(_bid_rows(bids, locs), hide_index=True, width="stretch")
+    if not editable:
+        return
+    if bids:
+        with st.expander("Retire a bid"):
+            pick = st.selectbox("Bid", bids, key="retire_pick", format_func=lambda b: (
+                f"{locs.get(b['location_id'], '—')} · {b['grain']} · {b['delivery_month']}"))
+            if st.button("Retire bid", key="retire_go"):
+                data.retire_bid(db, tenant_id, user["user_id"], pick["bid_id"])
+                _refresh()
+    with st.expander("Post a bid", expanded=not bids):
+        with st.form("post_bid", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            loc_id = c1.selectbox("Location", list(locs), format_func=locs.get)
+            grain = c2.selectbox("Grain", GRAINS)
+            month = c3.selectbox("Delivery month", _months())
+            c4, c5, c6, c7 = st.columns(4)
+            fut = c4.text_input("Futures symbol", placeholder="ZCZ26")
+            basis = c5.number_input("Basis (¢, e.g. -38)", value=None, step=1, format="%d")
+            cash = c6.number_input("Cash price ($/bu)", value=None, step=0.01, format="%.2f")
+            cap = c7.number_input("Bushel cap", value=None, min_value=0, step=1000, format="%d")
+            if st.form_submit_button("Post bid", type="primary"):
+                try:
+                    n = data.publish_bid(db, tenant_id, user["user_id"], grain=grain, delivery_month=month,
+                                         location_id=loc_id, futures_symbol=(fut.strip().upper() or None),
+                                         basis_cents=basis, cash_price=cash, bushel_cap=cap)
+                    st.session_state["bid_msg"] = _repriced_msg(n)
+                    _refresh()
+                except data.PortalError as e:
+                    st.error(str(e))
+
+
+@st.fragment
+def suggestions_view(db, tenant_id: str, user: dict) -> None:
+    if msg := st.session_state.pop("bid_msg", None):
+        st.success(msg)
+    st.caption("Bids pulled from your public cash-bid page. Nothing reaches farmers until you approve it.")
+    locs = _loc_names(db, tenant_id)
+    sugg = data.list_suggestions(db, tenant_id)
+    if not sugg:
+        st.info("Nothing waiting for review.")
+        return
+    for s in sugg:
+        with st.container(border=True, horizontal=True, vertical_alignment="bottom"):
+            st.markdown(f"**{locs.get(s['location_id'], '—')}** · {s['grain']} · {s['delivery_month']}"
+                        f"  \n{s['futures_symbol'] or ''} · source: {s['source']}")
+            basis = st.number_input("Basis (¢)", value=s["basis_cents"], step=1, format="%d",
+                                    key=f"sb_{s['suggestion_id']}")
+            if st.button("Approve", key=f"ok_{s['suggestion_id']}", type="primary"):
+                n = data.review_suggestion(db, tenant_id, user["user_id"], s["suggestion_id"], True,
+                                           basis_cents=basis)
+                st.session_state["bid_msg"] = _repriced_msg(n)
+                _refresh()
+            if st.button("Discard", key=f"no_{s['suggestion_id']}"):
+                data.review_suggestion(db, tenant_id, user["user_id"], s["suggestion_id"], False)
+                _refresh()
+
+
+CONTRACT_LABELS = {"CASH": "Cash (deliver and price)", "HTA": "HTA (hedge-to-arrive)",
+                   "FUTURES_ONLY": "Futures only"}
+OPEN = "Open price (my own number)"
+
+
+def _terms(o: dict) -> str:
+    px = f"${o['price']:.2f}/bu" if o["price_type"] == "FIXED" else \
+        f"{o['basis_cents']:+d}¢ on {o['futures_symbol']}"
+    return f"{o['bushels']:,} bu {o['grain']} · {o['contract_type']} · {px}"
+
+
+def _expiry(d: date | None):
+    return f"{d.isoformat()} 23:59:59" if d else None
+
+
+@st.fragment
+def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) -> None:
+    """farmer_id=None: a farmer submits their own offer. Otherwise staff place it for that farmer."""
+    tid = tenant["tenant_id"]
+    kp = f"f{farmer_id}_" if farmer_id else ""
+    locs = _loc_names(db, tid)
+    bids = data.list_bids(db, tid)
+    choices = [None] * (1 if tenant["open_pricing"] else 0) + bids
+    if not choices:
+        st.info("This elevator isn't taking offers right now.")
+        return
+    if st.session_state.pop("offer_sent", False):
+        st.success("Offer entered. Find it under Offers." if farmer_id else
+                   "Offer sent. You can follow it under My offers.")
+
+    def label(b):
+        return OPEN if b is None else (f"{locs.get(b['location_id'], '—')} · {b['grain']} · "
+                                       f"{b['delivery_month']} · "
+                                       + (f"{b['basis_cents']:+d}¢" if b["basis_cents"] is not None
+                                          else f"${b['cash_price']:.2f}"))
+    bid = st.selectbox("Make an offer against", choices, format_func=label, key=f"{kp}offer_bid")
+    # Everything below keys on the chosen bid so switching bids resets the defaults.
+    k = bid["bid_id"] if bid else "open"
+    with st.form(f"{kp}offer_form_{k}", clear_on_submit=True):
+        c1, c2, c3 = st.columns(3)
+        grain = bid["grain"] if bid else c1.selectbox("Grain", GRAINS)
+        if bid:
+            c1.text_input("Grain", grain, disabled=True)
+        contract = c2.selectbox("Contract type", list(data.CONTRACT_TYPES),
+                                format_func=CONTRACT_LABELS.get)
+        bushels = c3.number_input("Bushels", min_value=0, step=1000, value=5000, format="%d")
+        c4, c5, c6 = st.columns(3)
+        ptype = c4.segmented_control("Price type", list(data.PRICE_TYPES), default="BASIS")
+        basis = c5.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d")
+        fut = c6.text_input("Futures month (e.g. ZCZ26)", value=(bid["futures_symbol"] or "") if bid else "",
+                            placeholder="ZCZ26")
+        price = st.number_input("Fixed price ($/bu) — for fixed-price offers",
+                                value=bid["cash_price"] if bid else None, step=0.01, format="%.2f")
+        c7, c8, c9 = st.columns(3)
+        start = c7.date_input("Delivery from", value=None)
+        end = c8.date_input("Delivery to", value=None)
+        good = c9.date_input("Offer good until", value=None, min_value=date.today())
+        contract_ref = st.text_input("Contract reference # (optional)", max_chars=60)
+        note = st.text_area("Notes" if farmer_id else "Notes to the elevator", max_chars=500)
+        if st.form_submit_button("Enter offer" if farmer_id else "Send offer", type="primary"):
+            terms = dict(
+                grain=grain, contract_type=contract, price_type=ptype or "BASIS",
+                bushels=int(bushels), price=price if ptype == "FIXED" else None,
+                basis_cents=basis if ptype != "FIXED" else None,
+                futures_symbol=(fut.strip().upper() or None), bid_id=bid["bid_id"] if bid else None,
+                location_id=bid["location_id"] if bid else None,
+                delivery_start=start.isoformat() if start else None,
+                delivery_end=end.isoformat() if end else None, note=note or None,
+                contract_ref=contract_ref or None,
+                expires_at=_expiry(good))
+            try:
+                if farmer_id:
+                    data.place_offer_for_farmer(db, tid, user["user_id"], farmer_id, **terms)
+                else:
+                    data.create_offer(db, tid, user, **terms)
+                st.session_state["offer_sent"] = True
+                _refresh()
+            except data.PortalError as e:
+                st.error(str(e))
+
+
+def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
+    with st.container(border=True):
+        who = f" · {o['farmer_name'] or o['farmer_email']}" if staff else ""
+        if staff and o.get("farmer_client_id"):
+            who += f" · #{o['farmer_client_id']}"
+        if staff and o.get("farmer_phone"):
+            who += f" · {o['farmer_phone']}"
+        if o.get("placed_by"):
+            who += f" · entered by {o['placed_by_name'] or o['placed_by_email']}"
+        line = [data.STATUS_LABELS.get(o["status"], o["status"]).upper()]
+        flat = o["price_type"] == "FIXED" and o["contract_type"] != "FUTURES_ONLY"
+        if flat and o.get("implied_futures") is not None:
+            basis = f" ({o['basis_ref_cents']:+d}¢ basis)" if o.get("basis_ref_cents") is not None else ""
+            line.append(f"implied futures {o['implied_futures']:.4f}{basis}")
+        elif flat and staff:
+            line.append("no basis reference yet")
+        if data.bid_gap(o):
+            line.append(data.bid_gap(o))
+        if staff and o.get("hedged_at"):
+            line.append("hedged")
+        st.markdown(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]")
+        if staff and o.get("bid_reached"):
+            st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
+        meta = [x for x in (f"Delivery {o['delivery_start']} → {o['delivery_end']}" if o["delivery_start"] else "",
+                            f"Good until {str(o['expires_at'])[:10]}" if o["expires_at"] else "",
+                            f"Completed {str(o['completed_at'])[:10]}" if o.get("completed_at") else "",
+                            f"Contract # {o['contract_ref']}" if o.get("contract_ref") else "",
+                            o["note"] or "") if x]
+        if meta:
+            st.caption(" · ".join(meta))
+        if staff:
+            with st.expander("Edit notes / contract #"):
+                with st.form(f"details_{o['offer_id']}", border=False):
+                    c1, c2 = st.columns([1, 3])
+                    ref = c1.text_input("Contract reference #", o.get("contract_ref") or "", max_chars=60)
+                    note = c2.text_area("Notes", o["note"] or "", max_chars=500)
+                    if st.form_submit_button("Save"):
+                        try:
+                            data.update_offer_details(db, tenant_id, user["user_id"], o["offer_id"],
+                                                      note=note, contract_ref=ref)
+                            _refresh()
+                        except data.PortalError as e:
+                            st.error(str(e))
+        key = str(o["offer_id"])
+        if o["status"] == "submitted":
+            # The elevator marks an offer hit (or declines it). A farmer can withdraw their own; staff can
+            # record a withdrawal for a farmer who called in (flagged on_behalf in the offer history).
+            acts = ([("Mark hit", "hit", "primary"), ("Decline", "decline", "secondary"),
+                     ("Withdraw for farmer", "withdraw", "secondary")] if staff
+                    else [("Withdraw", "withdraw", "secondary")])
+            with st.container(horizontal=True):
+                for lbl, act, kind in acts:
+                    if st.button(lbl, key=f"{act}_{key}", type=kind):
+                        try:
+                            data.act_on_offer(db, tenant_id, user, o["offer_id"], act,
+                                              on_behalf=staff and act == "withdraw")
+                            _refresh()
+                        except data.PortalError as e:
+                            st.error(str(e))
+        elif o["status"] == "hit" and staff:
+            with st.form(f"complete_{key}", border=False):
+                c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
+                ref = c1.text_input("Contract number (required to complete)", o.get("contract_ref") or "",
+                                    max_chars=60)
+                if c2.form_submit_button("Complete and archive", type="primary"):
+                    try:
+                        data.complete_offer(db, tenant_id, user["user_id"], o["offer_id"], ref)
+                        _refresh()
+                    except data.PortalError as e:
+                        st.error(str(e))
+
+
+STAGES = {"Outstanding": ("submitted",), "Hit": ("hit",), "Completed": ("completed",),
+          "Closed": ("declined", "withdrawn", "expired")}
+
+
+@st.fragment
+def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
+    data.expire_stale(db, tenant_id)
+    rows = data.list_offers(db, tenant_id, user)
+    counts = {k: sum(1 for o in rows if o["status"] in v) for k, v in STAGES.items()}
+    stage = st.radio("Stage", list(STAGES), horizontal=True, label_visibility="collapsed",
+                     format_func=lambda k: f"{k} ({counts[k]})", key="offers_stage")
+    shown = [o for o in rows if o["status"] in STAGES[stage]]
+    if stage == "Outstanding":
+        shown.sort(key=lambda o: not o["bid_reached"])          # offers the bid has reached float to the top
+    elif stage == "Hit" and staff:
+        st.caption("These offers have been hit. Enter the contract number to complete one and move it to the archive.")
+    elif stage == "Completed":
+        st.caption("Archive: completed offers, each with its contract number.")
+    if not shown:
+        st.info("No offers here.")
+    for o in shown:
+        _offer_card(db, tenant_id, user, o, staff)
+
+
+ROLE_LABELS = {"farmer": "Farmer", "elevator_staff": "Elevator staff", "elevator_admin": "Elevator admin"}
+
+
+def _invite_link(tenant_id: str, token: str) -> str:
+    base = os.environ.get("OFFER_PORTAL_URL", "").rstrip("/")
+    return f"{base}/?t={tenant_id}&invite={token}"
+
+
+def _email_invite(tenant: dict, email: str, link: str) -> bool:
+    if not auth.graph_configured():
+        return False
+    name = html.escape(tenant["name"])
+    try:
+        auth.send_via_graph(email, f"You're invited to {tenant['name']}",
+                            f"<p>{name} has invited you to its grain offer portal.</p>"
+                            f"<p><a href=\"{html.escape(link)}\">Accept your invitation</a> "
+                            f"(the link works once and expires in 7 days).</p>")
+        return True
+    except Exception:
+        return False
+
+
+def join_view(db, tenant: dict, token: str) -> None:
+    st.title(tenant["name"])
+    inv = people.invite_preview(db, token, tenant["tenant_id"])
+    if not inv:
+        st.error("This invite link is invalid, expired, or already used. Ask your elevator for a new one.")
+        return
+    st.subheader("Accept your invitation")
+    st.caption(f"You're joining as {ROLE_LABELS[inv['role']].lower()} using {inv['email']}.")
+    with st.form("join_form"):
+        name = st.text_input("Your name")
+        if st.form_submit_button("Join", type="primary"):
+            try:
+                u = people.accept_invite(db, token, tenant["tenant_id"], name)
+            except data.PortalError as e:
+                st.error(str(e))
+                return
+            st.session_state.update(user=u, tenant_id=tenant["tenant_id"])
+            st.query_params.pop("invite", None)
+            st.rerun()
+
+
+@st.fragment
+def people_view(db, tenant: dict, user: dict) -> None:
+    tid = tenant["tenant_id"]
+    admin = user["role"] in ("elevator_admin", "platform_admin")
+    if link := st.session_state.pop("new_invite", None):
+        st.success(link["msg"])
+        st.code(link["url"], language=None)
+    st.subheader("Invite someone")
+    with st.form("invite_form", clear_on_submit=True):
+        c1, c2 = st.columns([3, 1])
+        email = c1.text_input("Email")
+        role = c2.selectbox("Role", list(ROLE_LABELS) if admin else ["farmer"], format_func=ROLE_LABELS.get)
+        if st.form_submit_button("Create invite", type="primary"):
+            try:
+                url = _invite_link(tid, people.create_invite(db, tid, user["user_id"], email, role))
+            except data.PortalError as e:
+                st.error(str(e))
+            else:
+                sent = _email_invite(tenant, email.strip().lower(), url)
+                st.session_state["new_invite"] = dict(url=url, msg=(
+                    "Invite emailed. You can also share this link yourself:" if sent else
+                    "Invite created. Email isn't set up here, so share this link yourself:"))
+                _refresh()
+
+    pend = people.pending_invites(db, tid, user["user_id"])
+    if pend:
+        st.subheader("Pending invites")
+        for p in pend:
+            with st.container(horizontal=True, vertical_alignment="center"):
+                st.markdown(f"{p['email']} · {ROLE_LABELS[p['role']]} · expires {str(p['expires_at'])[:10]}")
+                if st.button("Revoke", key=f"rv_{p['token_hash'][:12]}"):
+                    people.revoke_invite(db, tid, user["user_id"], p["token_hash"])
+                    _refresh()
+
+    st.subheader("People")
+    for u in people.list_users(db, tid, user["user_id"]):
+        with st.container(border=True, horizontal=True, vertical_alignment="center"):
+            st.markdown(f"**{u['name'] or u['email']}**  \n:grey[{u['email']}"
+                        f"{'' if u['active'] else ' · deactivated'}]")
+            if admin and u["user_id"] != user["user_id"] and u["role"] != "platform_admin":
+                new = st.selectbox("Role", list(ROLE_LABELS), index=list(ROLE_LABELS).index(u["role"]),
+                                   format_func=ROLE_LABELS.get, key=f"role_{u['user_id']}",
+                                   label_visibility="collapsed")
+                if new != u["role"]:
+                    people.set_user_role(db, tid, user["user_id"], u["user_id"], new)
+                    _refresh()
+                if st.button("Reactivate" if not u["active"] else "Deactivate", key=f"act_{u['user_id']}"):
+                    people.set_user_active(db, tid, user["user_id"], u["user_id"], not u["active"])
+                    _refresh()
+            else:
+                st.caption(ROLE_LABELS.get(u["role"], u["role"]))
+
+
+def _tenant_editor(db, user: dict, t: dict) -> None:
+    tid, uid = t["tenant_id"], user["user_id"]
+    st.caption(f"Link: {_invite_link(tid, '').split('&invite=')[0]}")
+    with st.form(f"brand_{tid}"):
+        name = st.text_input("Company name", t["name"])
+        c1, c2 = st.columns(2)
+        primary = c1.color_picker("Heading color", t["primary_color"] or "#32373c")
+        accent = c2.color_picker("Button color", t["accent_color"] or "#0693e3")
+        logo = st.text_input("Logo URL (https)", t["logo_url"] or "")
+        c3, c4 = st.columns(2)
+        support = c3.text_input("Support email", t["support_email"] or "")
+        from_name = c4.text_input("Email 'from' name", t["from_name"] or "")
+        c5, c6 = st.columns(2)
+        open_pricing = c5.toggle("Farmers may propose any price", bool(t["open_pricing"]))
+        hedging = c6.toggle("Hedging enabled (phase 2)", bool(t["hedging_enabled"]))
+        if st.form_submit_button("Save settings", type="primary"):
+            try:
+                platform.update_tenant(db, uid, tid, name=name, logo_url=logo, primary_color=primary,
+                                       accent_color=accent, support_email=support, from_name=from_name,
+                                       open_pricing=open_pricing, hedging_enabled=hedging)
+                st.success("Saved.")
+            except data.PortalError as e:
+                st.error(str(e))
+
+    st.markdown("**Locations**")
+    locs = data.list_locations(db, tid)
+    st.write(", ".join(f"{l['name']} ({l['state'] or '—'})" for l in locs) or "None yet.")
+    with st.form(f"loc_{tid}", clear_on_submit=True, border=False):
+        c1, c2, c3 = st.columns([3, 1, 1], vertical_alignment="bottom")
+        n, s = c1.text_input("New location"), c2.text_input("State", max_chars=2)
+        if c3.form_submit_button("Add"):
+            try:
+                platform.add_location(db, uid, tid, n, s)
+                _refresh()
+            except data.PortalError as e:
+                st.error(str(e))
+
+    st.markdown("**Bid scrape sources**")
+    for src in platform.list_sources(db, uid, tid):
+        with st.container(horizontal=True, vertical_alignment="center"):
+            st.markdown(f"{src['kind']} · {src['url']}  \n:grey[{src['location_name'] or 'all locations'} · "
+                        f"last run: {src['last_status'] or 'never'}]")
+            on = st.toggle("Active", bool(src["active"]), key=f"src_{src['source_id']}")
+            if on != bool(src["active"]):
+                platform.set_source_active(db, uid, tid, src["source_id"], on)
+                _refresh()
+    with st.form(f"srcadd_{tid}", clear_on_submit=True, border=False):
+        c1, c2, c3 = st.columns([1, 3, 2], vertical_alignment="bottom")
+        kind = c1.selectbox("Type", platform.SOURCE_KINDS)
+        url = c2.text_input("Site or bids page (https)")
+        loc = c3.selectbox("Location (Bushel only)", [""] + [l["name"] for l in locs])
+        if st.form_submit_button("Add source"):
+            try:
+                platform.add_source(db, uid, tid, kind, url, loc)
+                _refresh()
+            except data.PortalError as e:
+                st.error(str(e))
+    if st.button("Run scrapers now", key=f"run_{tid}"):
+        with st.spinner("Fetching bids…"):
+            out = scrape_run.run(db, tid)
+        st.info("\n\n".join(f"{k[1]}: {v}" for k, v in out.items()) or "No active sources.")
+
+    st.markdown("**Status**")
+    suspended = t["status"] != "active"
+    if st.button("Reactivate tenant" if suspended else "Suspend tenant", key=f"susp_{tid}"):
+        platform.set_tenant_status(db, uid, tid, suspended)
+        _refresh()
+
+
+@st.fragment
+def platform_view(db, user: dict) -> None:
+    uid = user["user_id"]
+    section = st.radio("Section", ["Tenants", "Usage report"], horizontal=True, label_visibility="collapsed")
+    if section == "Usage report":
+        month = st.text_input("Month (YYYY-MM)", data.today_ct().strftime("%Y-%m"))
+        try:
+            rows = platform.usage_table(db, uid, month)
+        except data.PortalError as e:
+            st.error(str(e))
+            return
+        st.dataframe(rows, hide_index=True, width="stretch", column_config={
+            "offer_submitted": "Offers submitted", "offer_hit": "Offers hit", "offer_completed": "Offers completed",
+            "bid_published": "Bids published", "user_joined": "Users joined",
+            "active_farmers": "Active farmers"})
+        csv = "Tenant,Offers submitted,Offers hit,Offers completed,Bids published,Users joined,Active farmers\n" + "\n".join(
+            f"\"{r['Tenant']}\",{r['offer_submitted']},{r['offer_hit']},{r['offer_completed']},{r['bid_published']},"
+            f"{r['user_joined']},{r['active_farmers']}" for r in rows)
+        st.download_button("Download CSV", csv, file_name=f"usage-{month}.csv", mime="text/csv")
+        return
+
+    tenants = platform.list_tenants(db, uid)
+    with st.expander("Create a tenant", expanded=not tenants):
+        with st.form("new_tenant", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            name = c1.text_input("Company name")
+            slug = c2.text_input("Slug (the ?t= in their link)", placeholder="rcm")
+            admin_email = st.text_input("First elevator admin's email")
+            locs = st.text_area("Locations — one per line, as Name, ST", placeholder="Riverton, IL")
+            if st.form_submit_button("Create tenant", type="primary"):
+                parsed = [tuple(p.strip() for p in (ln.rsplit(",", 1) + [""])[:2]) if "," in ln else (ln.strip(), "")
+                          for ln in locs.splitlines() if ln.strip()]
+                try:
+                    tok = platform.create_tenant(db, uid, slug, name, admin_email, parsed)
+                except data.PortalError as e:
+                    st.error(str(e))
+                else:
+                    url = _invite_link(slug.strip().lower(), tok)
+                    st.session_state["new_invite"] = dict(url=url, msg="Tenant created. Send this link to their first admin:")
+                    _refresh()
+    if link := st.session_state.pop("new_invite", None):
+        st.success(link["msg"])
+        st.code(link["url"], language=None)
+    if not tenants:
+        return
+    pick = st.selectbox("Tenant", tenants, format_func=lambda t: f"{t['name']} ({t['tenant_id']})"
+                        + ("" if t["status"] == "active" else " — suspended"), key="plat_pick")
+    _tenant_editor(db, user, pick)
+
+
+def _farmer_label(f: dict) -> str:
+    return (f["name"] + (f" · #{f['client_id']}" if f["client_id"] else "")
+            + (f" · {f['phone']}" if f["phone"] else "") + ("" if f["active"] else " (inactive)"))
+
+
+def _farmer_fields(f: dict | None = None) -> dict:
+    """The farmer inputs (call inside a form). Returns kwargs for farmers.create/update_farmer."""
+    f = f or {}
+    c1, c2 = st.columns(2)
+    client_id = c1.text_input("Client ID (your account number)", f.get("client_id") or "")
+    entity = c2.text_input("Entity name", f.get("entity_name") or "")
+    c3, c4, c5 = st.columns(3)
+    individual = c3.text_input("Individual name", f.get("individual_name") or "")
+    phone = c4.text_input("Phone", f.get("phone") or "")
+    email = c5.text_input("Email (optional)", f.get("email") or "")
+    return dict(individual_name=individual, phone=phone, email=email, entity_name=entity, client_id=client_id)
+
+
+@st.fragment
+def place_offer_view(db, tenant: dict, user: dict) -> None:
+    """Staff enter an offer for a farmer who called or stopped by."""
+    tid = tenant["tenant_id"]
+    st.caption("Enter an offer on a farmer's behalf. It goes to your Offers inbox like any other offer.")
+    flist = farmers.list_farmers(db, tid, user["user_id"])
+    NEW = {"farmer_id": None}
+    if (pending := st.session_state.pop("place_farmer_new", None)) is not None:    # just added: preselect them
+        st.session_state["place_farmer"] = next((f for f in flist if f["farmer_id"] == pending), NEW)
+    pick = st.selectbox("Farmer", [NEW] + flist, key="place_farmer",
+                        format_func=lambda f: "+ New farmer…" if f is NEW else _farmer_label(f))
+    if pick is NEW:
+        with st.form("quick_farmer", clear_on_submit=True):
+            fields = _farmer_fields()
+            if st.form_submit_button("Add farmer"):
+                try:
+                    st.session_state["place_farmer_new"] = farmers.create_farmer(
+                        db, tid, user["user_id"], **fields)
+                except data.PortalError as e:
+                    st.error(str(e))
+                else:
+                    _refresh()
+        return
+    offer_form_view(db, tenant, user, farmer_id=pick["farmer_id"])
+
+
+@st.fragment
+def farmers_view(db, tenant: dict, user: dict) -> None:
+    tid = tenant["tenant_id"]
+    if link := st.session_state.pop("new_invite", None):
+        st.success(link["msg"])
+        st.code(link["url"], language=None)
+    with st.expander("Add a farmer"):
+        with st.form("add_farmer", clear_on_submit=True):
+            fields = _farmer_fields()
+            if st.form_submit_button("Add farmer", type="primary"):
+                try:
+                    farmers.create_farmer(db, tid, user["user_id"], **fields)
+                    _refresh()
+                except data.PortalError as e:
+                    st.error(str(e))
+    rows = farmers.list_farmers(db, tid, user["user_id"], include_inactive=True)
+    if not rows:
+        st.info("No farmers yet. Add one, or place an offer and add them there.")
+    for f in rows:
+        with st.container(border=True):
+            top = st.container(horizontal=True, vertical_alignment="center")
+            top.markdown(f"**{f['name']}**  \n:grey[{'#' + f['client_id'] if f['client_id'] else 'no client ID'} · "
+                         f"{f['phone'] or 'no phone'} · {f['email'] or 'no email'} · "
+                         f"{'portal login' if f['user_id'] else 'no login'} · {f['open_offers']} open offers"
+                         f"{'' if f['active'] else ' · inactive'}]")
+            with top:
+                if not f["user_id"] and f["active"] and f["email"]:
+                    if st.button("Invite to portal", key=f"finv_{f['farmer_id']}"):
+                        try:
+                            tok = people.create_invite(db, tid, user["user_id"], f["email"], "farmer",
+                                                       farmer_id=f["farmer_id"])
+                        except data.PortalError as e:
+                            st.error(str(e))
+                        else:
+                            url = _invite_link(tid, tok)
+                            sent = _email_invite(tenant, f["email"], url)
+                            st.session_state["new_invite"] = dict(url=url, msg=(
+                                "Invite emailed. You can also share this link yourself:" if sent else
+                                "Invite created. Email isn't set up here, so share this link yourself:"))
+                            _refresh()
+                if st.button("Reactivate" if not f["active"] else "Deactivate", key=f"fact_{f['farmer_id']}"):
+                    farmers.set_farmer_active(db, tid, user["user_id"], f["farmer_id"], not f["active"])
+                    _refresh()
+            with st.expander("Edit"):
+                with st.form(f"edit_farmer_{f['farmer_id']}", border=False):
+                    fields = _farmer_fields(f)
+                    if st.form_submit_button("Save"):
+                        try:
+                            farmers.update_farmer(db, tid, user["user_id"], f["farmer_id"], **fields)
+                            _refresh()
+                        except data.PortalError as e:
+                            st.error(str(e))
+
+
+@st.fragment
+def summary_view(db, tenant_id: str, user: dict) -> None:
+    """Offers by commodity and delivery period, with filters."""
+    all_rows = data.list_offers(db, tenant_id, user)
+    c1, c2, c3, c4 = st.columns(4)
+    grains = c1.multiselect("Commodity", sorted({o["grain"] for o in all_rows}))
+    periods = c2.multiselect("Delivery period", sorted({o["delivery_period"] for o in all_rows}))
+    entity = c3.text_input("Entity name contains")
+    indiv = c4.text_input("Individual name contains")
+    stages = st.multiselect("Stage", list(STAGES), default=["Outstanding", "Hit"])
+    statuses = tuple(x for k in stages for x in STAGES[k])
+    res = data.offer_summary(db, tenant_id, user["user_id"], grains=grains, periods=periods, entity=entity,
+                             individual=indiv, statuses=statuses)
+    if not res["offers"]:
+        st.info("No offers match these filters.")
+        return
+    m1, m2 = st.columns(2)
+    m1.metric("Offers", len(res["offers"]))
+    m2.metric("Bushels", f"{sum(o['bushels'] for o in res['offers']):,}")
+    st.subheader("By commodity and delivery period")
+    st.dataframe([{"Commodity": g["grain"], "Delivery period": g["period"], "Offers": g["offers"],
+                   "Bushels": g["bushels"], "Avg flat price": g["avg_flat_price"],
+                   "Avg implied futures": g["avg_implied_futures"], "Avg basis (¢)": g["avg_basis_cents"]}
+                  for g in res["groups"]], hide_index=True, width="stretch",
+                 column_config={"Bushels": st.column_config.NumberColumn(format="%d"),
+                                "Avg flat price": st.column_config.NumberColumn(format="$%.4f"),
+                                "Avg implied futures": st.column_config.NumberColumn(format="%.4f")})
+    st.subheader("Offers")
+    st.dataframe([{"Commodity": o["grain"], "Delivery period": o["delivery_period"],
+                   "Entity": o["farmer_entity"] or "", "Individual": o["farmer_individual"] or "",
+                   "Client ID": o["farmer_client_id"] or "", "Type": o["contract_type"],
+                   "Flat price": o["price"] if o["price_type"] == "FIXED" else None,
+                   "Basis (¢)": o["basis_cents"] if o["price_type"] == "BASIS" else None,
+                   "Implied futures": o["implied_futures"], "Futures month": o["futures_symbol"],
+                   "Bushels": o["bushels"], "Stage": data.STATUS_LABELS.get(o["status"], o["status"]),
+                   "Contract #": o["contract_ref"] or ""} for o in res["offers"]],
+                 hide_index=True, width="stretch",
+                 column_config={"Bushels": st.column_config.NumberColumn(format="%d"),
+                                "Flat price": st.column_config.NumberColumn(format="$%.4f"),
+                                "Implied futures": st.column_config.NumberColumn(format="%.4f")})
+
+
+def _level_label(b: dict) -> str:
+    if b["level"] is None:
+        return "no basis reference"
+    return f"{int(b['level']):+d}¢ basis" if b["kind"] == "Basis (HTA)" else f"{b['level']:.4f}"
+
+
+def _hedge_tables(totals: list[dict], lines: list[dict]) -> None:
+    st.markdown("**Contracts by futures month**")
+    st.dataframe([{"Commodity": t["grain"], "Futures month": t["futures_symbol"], "Offers": t["offers"],
+                   "Bushels": t["bushels"], "Contracts": t["contracts"], "Whole contracts": t["whole_contracts"],
+                   "Left over (bu)": t["remainder_bushels"]} for t in totals],
+                 hide_index=True, width="stretch",
+                 column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
+    st.markdown("**By price level**")
+    st.dataframe([{"Commodity": b["grain"], "Futures month": b["futures_symbol"], "Type": b["kind"],
+                   "Price level": _level_label(b), "Offers": b["offers"], "Bushels": b["bushels"],
+                   "Contracts": b["contracts"]} for b in lines],
+                 hide_index=True, width="stretch",
+                 column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
+
+
+@st.fragment
+def hedge_view(db, tenant_id: str, user: dict) -> None:
+    """Admin only: how many contracts to hedge, at what prices."""
+    if user["role"] not in ("elevator_admin", "platform_admin"):
+        st.error("This page is for elevator admins.")
+        return
+    h = data.hedge_summary(db, tenant_id, user["user_id"])
+    st.subheader("Hit offers: hedge now")
+    if not h["now"]:
+        st.info("No hit offers are waiting to be hedged.")
+    else:
+        _hedge_tables(h["now_totals"], h["now"])
+        with st.expander("Mark offers as hedged"):
+            picks = st.multiselect("Hit offers not yet hedged", h["now_offers"], key="hedge_pick",
+                                   format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
+                                                         f"{o['futures_symbol']} · #{o['offer_id']}")
+            if st.button("Mark selected as hedged", key="hedge_go", disabled=not picks):
+                data.mark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in picks])
+                _refresh()
+    st.subheader("Outstanding offers: if they are hit")
+    if not h["potential"]:
+        st.info("No outstanding offers.")
+    else:
+        _hedge_tables(h["potential_totals"], h["potential"])
+    st.caption("Contracts = bushels divided by the contract size (5,000 bu for corn, soybeans and wheat). "
+               "Flat-price offers show the implied futures price (flat price less the posted basis), and it moves "
+               "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")
+
+
+def main() -> None:
+    try:
+        db = get_db()
+    except Exception:
+        st.error("The portal can't reach its database. Please contact JSA support.")
+        st.stop()
+    slug = (st.query_params.get("t") or "").strip().lower()
+    tenant = data.get_tenant(db, slug) if slug else None
+    if not tenant:
+        st.title("Offer portal")
+        st.info("Please use the link your elevator gave you.")
+        st.stop()
+    _brand(tenant)
+
+    user = st.session_state.get("user")
+    if not user or st.session_state.get("tenant_id") != tenant["tenant_id"]:
+        st.session_state.pop("user", None)
+        if st.query_params.get("invite"):
+            join_view(db, tenant, st.query_params["invite"])
+        else:
+            login_view(db, tenant)
+        st.stop()
+
+    st.title(tenant["name"])
+    with st.sidebar:
+        st.caption(f"{user['email']} · {user['role'].replace('_', ' ')}")
+        if st.button("Sign out"):
+            for k in ("user", "tenant_id", "login_step"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    staff = user["role"] in data.ELEVATOR_ROLES or user["role"] == "platform_admin"
+    tid = tenant["tenant_id"]
+    admin = user["role"] in ("elevator_admin", "platform_admin")
+    views = (["Offers", "Summary"] + (["Hedge"] if admin else []) +
+             ["Place offer", "Farmers", "Bid board", "Review scraped bids", "People"] if staff
+             else ["Bid board", "Make an offer", "My offers"])
+    if user["role"] == "platform_admin":
+        views = views + ["Platform"]
+    view = st.radio("View", views, horizontal=True, label_visibility="collapsed")
+    if view == "Platform":
+        platform_view(db, user)
+    elif view == "Summary":
+        summary_view(db, tid, user)
+    elif view == "Hedge":
+        hedge_view(db, tid, user)
+    elif view == "People":
+        people_view(db, tenant, user)
+    elif view == "Place offer":
+        place_offer_view(db, tenant, user)
+    elif view == "Farmers":
+        farmers_view(db, tenant, user)
+    elif view == "Review scraped bids":
+        suggestions_view(db, tid, user)
+    elif view == "Bid board":
+        published_view(db, tid, user, editable=staff)
+    elif view == "Make an offer":
+        offer_form_view(db, tenant, user)
+    else:
+        offers_view(db, tid, user, staff)
+
+
+main()

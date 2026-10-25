@@ -1,0 +1,8 @@
+streamlit>=1.51
+pandas>=2.0
+snowflake-connector-python>=3.7
+cryptography
+python-dotenv
+pytest
+requests
+beautifulsoup4
