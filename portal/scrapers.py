@@ -11,6 +11,8 @@ import json
 import re
 from datetime import datetime
 
+from .data import month_bounds
+
 import requests
 
 UA = {"User-Agent": "Mozilla/5.0 (compatible; JPSI offer portal; kpostin@jpsi.com)"}
@@ -53,8 +55,16 @@ def parse_agricharts(feed: list[dict]) -> list[dict]:
                 continue
             if b.get("basis") is None or not b.get("symbol"):
                 continue
+            try:
+                de = datetime.strptime(b.get("delivery_end") or "", "%m/%d/%Y")
+            except ValueError:
+                de = None
+            if de is not None and de < ds:
+                de = None                                  # a nonsense range is no range: staff will be asked for one
             out.append(dict(location_name=name, grain=norm_grain(b.get("name")),
                             delivery_month=ds.strftime("%Y-%m"), futures_symbol=b["symbol"],
+                            delivery_start=ds.strftime("%Y-%m-%d") if de else None,
+                            delivery_end=de.strftime("%Y-%m-%d") if de else None,
                             basis_cents=int(b["basis"]), cash_price=_money(b.get("price"))))
     return out
 
@@ -70,6 +80,16 @@ def _fut_symbol(fut_month: str, grain: str) -> str | None:
     m = re.search(r"([A-Za-z]{3})[A-Za-z]*\s+(\d{2})", fut_month or "")
     code = _MON.get(m.group(1).lower()) if m else None
     return f"{_ROOT[grain]}{code}{m.group(2)}" if code else None
+
+
+def _bushel_range(label: str) -> tuple[str | None, str | None]:
+    """Delivery range from a Bushel row label. Only a plain month ('January 2027') is a clear range (the whole month);
+    'Harvest 2026', 'New crop', seasons or multi-month labels are NOT, and return (None, None) so staff must enter one."""
+    m = re.match(r"^([a-z]{3})[a-z]*\.?\s+(20\d{2})$", (label or "").strip().lower())
+    if not m or m.group(1) not in _MONNUM:
+        return None, None
+    first, last = month_bounds(f"{m.group(2)}-{_MONNUM[m.group(1)]:02d}")
+    return first.isoformat(), last.isoformat()
 
 
 def _bushel_month(label: str) -> str | None:
@@ -101,7 +121,9 @@ def parse_bushelsites(html: str, location_name: str) -> list[dict]:
             except (KeyError, ValueError):
                 continue
             if month and sym:
+                ds, de = _bushel_range(c["c1"])
                 out.append(dict(location_name=location_name, grain=grain, delivery_month=month,
+                                delivery_start=ds, delivery_end=de,
                                 futures_symbol=sym, basis_cents=basis, cash_price=_money(c.get("c2"))))
     return out
 

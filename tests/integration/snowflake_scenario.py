@@ -99,6 +99,8 @@ check(len([1 for _ in db.query("SELECT 1 FROM login_codes WHERE email = '" + E("
 check(auth.verify_code(db, E("pat"), sent[-1], "someone-else") is None, "wrong tenant page")
 
 step("bids + offers: flat / basis / futures-only / open-priced, implied futures, bid_gap")
+# futures_quotes is global and survives between runs; a leftover (now stale) quote would make the flat bid unpriced
+db.execute("UPDATE futures_quotes SET symbol = 'OLD_' || symbol WHERE symbol NOT LIKE 'OLD%'")
 month = (date.today() + timedelta(days=45)).strftime("%Y-%m")
 data.publish_bid(db, slug, S, grain="Corn", delivery_month=month, location_id=locs["Main"], futures_symbol="ZCZ26",
                  basis_cents=-38, cash_price=4.18)
@@ -156,6 +158,9 @@ step("manual hit, decline, withdraw (+ on behalf), completion needs a contract n
 raises(lambda: data.act_on_offer(db, slug, pat, hta, "hit"), "farmer can't hit")
 check(data.act_on_offer(db, slug, staff, hta, "hit") == "hit", "manual hit")
 check(data.list_offers(db, slug, boss)[0] is not None, "list")
+raises(lambda: data.complete_offer(db, slug, S, flat, "C-1001"), "must acknowledge before completing")
+data.acknowledge_offer(db, slug, S, flat)
+data.acknowledge_offer(db, slug, S, hta)
 raises(lambda: data.complete_offer(db, slug, S, flat, ""), "contract number required")
 data.complete_offer(db, slug, S, flat, "C-1001")
 data.complete_offer(db, slug, S, hta, "PRE-1")
@@ -199,7 +204,9 @@ out = scrape_run.run(db, slug, fetch=lambda src: items)
 check(list(out.values())[0] == dict(staged=1, unchanged=0, unmatched=1, stale=0), out)
 sug = data.list_suggestions(db, slug)
 check(len(sug) == 1, sug)
-n = data.review_suggestion(db, slug, S, sug[0]["suggestion_id"], True, basis_cents=-22)
+raises(lambda: data.review_suggestion(db, slug, S, sug[0]["suggestion_id"], True, basis_cents=-22), "no delivery range yet")
+n = data.review_suggestion(db, slug, S, sug[0]["suggestion_id"], True, basis_cents=-22,
+                           delivery_start=f"{month}-01", delivery_end=f"{month}-28")
 check(n == 0 and [b for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZCH27"][0]["basis_cents"] == -22, "approve with edit")
 check(db.query("SELECT last_status FROM scrape_sources WHERE tenant_id = %s", (slug,))[0]["last_status"].startswith("ok staged=1"), "source status")
 
@@ -227,29 +234,123 @@ check(data.list_offers(db, "rcm", admin) == [] or True, "rcm read ok")
 check(all(o["tenant_id"] == slug for o in data.list_offers(db, slug, boss)), "only itest offers")
 check(data.list_bids(db, "dorans") == [] or all(b["tenant_id"] == "dorans" for b in data.list_bids(db, "dorans")), "dorans bids")
 
-step("delayed futures (needs sql/05 applied to this schema): store quotes, staged suggestion, sticky bid, show_futures switch")
+step("delayed futures: one latest quote per month, the flat bid is LIVE (futures + sticky basis), stale quotes price nothing, hits run on refresh")
 from portal import futures  # noqa: E402
 data.publish_bid(db, slug, S, grain="Soybeans", delivery_month=month, location_id=locs["North"], futures_symbol="ZSX26",
                  basis_cents=-45, cash_price=11.80)
-platform.set_source_active(db, A, slug, db.query("SELECT source_id FROM scrape_sources WHERE tenant_id = %s", (slug,))[0]["source_id"], False)
 q = {"ZSX26": {"price": 12.30, "as_of": datetime.now(timezone.utc)}, "ZCZ26": {"price": 4.60, "as_of": None}}
 check(futures.update_quotes(db, q) == 2, "store quotes")
 futures.update_quotes(db, {"ZSX26": {"price": 12.35, "as_of": datetime.now(timezone.utc)}})        # update path, not a second row
 got = futures.list_quotes(db, {"ZSX26", "ZCZ26"})
 check(got["ZSX26"]["price"] == 12.35 and len(db.query("SELECT 1 FROM futures_quotes WHERE symbol = 'ZSX26'")) == 1, got)
-print("    stamp:", futures.latest_stamp(got))
 sb = [b for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZSX26"][0]
-check(futures.indicated_cash(sb, got["ZSX26"]) == 11.9, futures.indicated_cash(sb, got["ZSX26"]))   # 12.35 - 0.45
-check(futures.suggest_cash_updates(db, slug)["staged"] >= 1, "staged")
-sug = [x for x in data.list_suggestions(db, slug) if x["source"] == "massive:delayed" and x["futures_symbol"] == "ZSX26"]
-check(len(sug) == 1 and abs(sug[0]["cash_price"] - 11.9) < 1e-9, sug)
-check([b["cash_price"] for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZSX26"] == [11.8], "bid stays sticky")
-data.review_suggestion(db, slug, S, sug[0]["suggestion_id"], True, cash_price=11.88)
-check([b["cash_price"] for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZSX26"] == [11.88], "confirmed -> published")
+check((sb["flat_price"], sb["flat_source"], sb["basis_cents"], sb["cash_price"]) == (11.9, "futures", -45, 11.8), sb)   # 12.35 - 0.45
+futures.update_quotes(db, {"ZSX26": {"price": 12.60, "as_of": datetime.now(timezone.utc)}})
+sb = [b for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZSX26"][0]
+check((sb["flat_price"], sb["basis_cents"], sb["cash_price"]) == (12.15, -45, 11.8), sb)             # moves with futures; stored bid untouched
+db.execute("UPDATE futures_quotes SET fetched_at = %s WHERE symbol = 'ZSX26'",
+           ((datetime.now(timezone.utc) - timedelta(minutes=data.QUOTE_MAX_AGE_MIN + 10)).strftime("%Y-%m-%d %H:%M:%S"),))
+sb = [b for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZSX26"][0]
+check((sb["flat_price"], sb["flat_source"]) == (None, "stale"), sb)                                     # a dead feed prices nothing
+futures.update_quotes(db, {"ZSX26": {"price": 12.60, "as_of": datetime.now(timezone.utc)}})
+soy = data.create_offer(db, slug, pat, grain="Soybeans", contract_type="CASH", price_type="FIXED", bushels=4000, price=12.10,
+                        futures_symbol="ZSX26", bid_id=sb["bid_id"])                                    # 12.15 live bid >= 12.10: reached
+check([o for o in data.list_offers(db, slug, boss) if o["offer_id"] == soy][0]["bid_reached"] is True, "live flat bid reached the offer")
+data.add_auto_hit_rule(db, slug, B, grain="Soybeans")
+check([o for o in data.list_offers(db, slug, boss) if o["offer_id"] == soy][0]["status"] == "hit", "new rule hits it")
+ev = db.query("SELECT detail:hit_context.flat_price::float AS f, detail:hit_context.futures_quote::float AS q FROM offer_events "
+              "WHERE offer_id = %s AND event_type = 'hit'", (soy,))[0]
+check(abs(ev["f"] - 12.15) < 1e-9 and abs(ev["q"] - 12.60) < 1e-9, ev)                                  # the hit keeps the price that triggered it
 platform.update_tenant(db, A, slug, name=NAME, logo_url=None, primary_color="#112233", accent_color="#abcdef",
                        support_email=None, from_name=None, open_pricing=True, hedging_enabled=False, show_futures=True)
 check(bool(data.get_tenant(db, slug)["show_futures"]) is True, "show_futures switch")
 out = futures.run_update(db, fetch=lambda syms: {"ZCZ26": {"price": 4.62, "as_of": None}})
 check(out["status"] == "ok" and out["quotes"] == 1, out)
+
+step("cancel after a hit: admin hedge-adjustment list; acknowledge/cancel columns (needs sql/06)")
+c1 = data.create_offer(db, slug, pat, grain="Corn", contract_type="HTA", price_type="BASIS", bushels=5000,
+                       basis_cents=-30, futures_symbol="ZCZ26")
+data.act_on_offer(db, slug, staff, c1, "hit")
+data.mark_hedged(db, slug, B, [c1])
+data.cancel_offer(db, slug, S, c1, "Farmer called to cancel")
+adj = data.hedge_adjustments(db, slug, B)
+check([(a["offer_id"], a["was_hedged"], a["contracts"]) for a in adj] == [(c1, True, 1.0)], adj)
+check(data.mark_hedge_adjusted(db, slug, B, [c1]) == 1 and data.hedge_adjustments(db, slug, B) == [], "adjusted")
+o = [x for x in data.list_offers(db, slug, boss) if x["offer_id"] == c1][0]
+check(o["status"] == "cancelled", o)
+check(o["cancel_reason"] == "Farmer called to cancel" and o["hedge_adjusted_at"] is not None and o["acknowledged_at"] is None, o)
+
+step("email outbox: queued per event, opt-outs, send marks sent (nothing is really emailed)")
+from portal import notify  # noqa: E402
+kinds = {r["kind"] for r in db.query("SELECT DISTINCT kind FROM notifications WHERE tenant_id = %s", (slug,))}
+check({"offer_submitted", "offer_hit", "offer_completed", "offer_cancelled"} <= kinds, kinds)
+adm = [r for r in db.query("SELECT to_email, subject FROM notifications WHERE tenant_id = %s AND kind = 'offer_cancelled'", (slug,))]
+check(any(r["to_email"] == E("boss") and r["subject"].startswith("ADJUST HEDGE") for r in adm), adm)
+check(all(r["to_email"] != E("staff") for r in adm), "cancellation goes to admins and the farmer, not staff")
+notify.set_notify(db, S, False)
+check(all(r["user_id"] != S for r in notify.staff_recipients(db, slug)), "opt-out honoured (COALESCE(notify_email, TRUE))")
+notify.set_notify(db, S, True)
+sent = []
+res = notify.send_pending(db, send=lambda to, subject, html: sent.append(to), limit=500)
+check(res["sent"] == len(sent) > 0 and res["failed"] == 0, res)
+check(db.query("SELECT COUNT(*) AS n FROM notifications WHERE tenant_id = %s AND status = 'sent' AND sent_at IS NOT NULL", (slug,))[0]["n"] > 0, "marked sent")
+
+step("staff purchases log + daily recap (admin sees all, staff their own; one email per person per day)")
+from portal import purchases, recap  # noqa: E402
+p1 = purchases.add_purchase(db, slug, S, grain="Corn", bushels=5000, counterparty="Smith Farms", price=4.25,
+                            location_id=locs["Main"], delivery_period=month)
+p2 = purchases.add_purchase(db, slug, B, grain="Corn", bushels=15000, farmer_id=fid, price=None, basis_cents=-30,
+                            futures_symbol="ZCZ26", delivery_period=month)
+mine = purchases.list_purchases(db, slug, staff)
+check([p["purchase_id"] for p in mine] == [p1] and mine[0]["delivery_location"] == "Main", mine)
+allp = purchases.list_purchases(db, slug, boss)
+check({p["purchase_id"] for p in allp} == {p1, p2}, allp)
+summ = purchases.summarize(allp)[0]
+check(summ["bushels"] == 20000 and summ["avg_price"] == 4.25 and summ["avg_basis_cents"] == -30.0, summ)
+purchases.void_purchase(db, slug, staff, p1)
+check({p["purchase_id"] for p in purchases.list_purchases(db, slug, boss)} == {p2}, "voided entry hidden")
+rs = recap.build_recap(db, slug, boss)
+check(rs["counts"]["purchases"] == 1 and rs["counts"]["hit_today"] >= 3, rs["counts"])          # hit_at day computed in Central time
+rt = recap.build_recap(db, slug, staff)
+check("Logged by" not in rt["html"] and "substantial risk of loss" in rt["html"], "staff recap is their own")
+day = data.today_ct()
+q1 = recap.send_daily_recaps(db, day, slug)["queued"]
+check(q1 >= 2 and recap.send_daily_recaps(db, day, slug)["queued"] == 0, q1)                    # once per person per day
+
+step("housekeeping: replaced bids / old suggestions are pruned, nothing a hit needs is lost (needs the DELETE grants in sql/06)")
+out = data.prune_price_history(db, slug)
+check(set(out) == {"retired_bids_deleted", "suggestions_deleted"}, out)                          # runs under the service role's grants
+check(all(b["bid_id"] for b in data.list_bids(db, slug)), "live bids intact")
+
+step("delivery ranges (needs sql/08): bid window in DATE columns, offers expire the day after the last delivery day, unclear scrapes need a range")
+today = data.today_ct()
+D = lambda n: (today + timedelta(days=n)).isoformat()
+data.publish_bid(db, slug, S, grain="Wheat", delivery_month=today.strftime("%Y-%m"), location_id=locs["Main"], futures_symbol="ZWZ26",
+                 basis_cents=-20, cash_price=6.0, delivery_start=D(-10), delivery_end=D(3))
+wb = [b for b in data.list_bids(db, slug) if b["grain"] == "Wheat"][0]
+check(isinstance(wb["window_end"], date) and str(wb["window_start"]) == D(-10) and str(wb["window_end"]) == D(3), wb)
+W = dict(grain="Wheat", contract_type="HTA", price_type="BASIS", bushels=5000, basis_cents=-25, futures_symbol="ZWZ26")
+w_bid = data.create_offer(db, slug, pat, **W, bid_id=wb["bid_id"])                       # inherits the bid's range
+w_today = data.create_offer(db, slug, pat, **W, delivery_end=D(0))                      # the last day itself is still alive
+raises(lambda: data.create_offer(db, slug, pat, **W, delivery_end=D(-1)), "a delivery period that already ended is refused")
+w_old = data.create_offer(db, slug, pat, **W, delivery_end=D(2))
+db.execute("UPDATE offers SET delivery_end = %s WHERE offer_id = %s", (D(-1), w_old))   # yesterday was its last delivery day
+check(data.expire_stale(db, slug) == 1, "only the one whose last day passed")
+st = {o["offer_id"]: o["status"] for o in data.list_offers(db, slug, boss)}
+check(st[w_old] == "expired" and st[w_bid] == "submitted" and st[w_today] == "submitted", st)
+ev = db.query("SELECT detail:reason::string AS r FROM offer_events WHERE offer_id = %s AND event_type = 'expired'", (w_old,))[0]
+check(ev["r"] == "delivery_period_ended", ev)
+db.execute("UPDATE offers SET bid_snapshot = OBJECT_INSERT(bid_snapshot::OBJECT, 'delivery_end', %s, TRUE) WHERE offer_id = %s", (D(-1), w_bid))
+check(data.expire_stale(db, slug) == 1, "the bid's range (kept in the VARIANT snapshot) drives expiry too")
+check({o["offer_id"]: o["status"] for o in data.list_offers(db, slug, boss)}[w_bid] == "expired", "expired via the snapshot")
+data.sync_suggestions(db, slug, "t", [dict(location_name="Main", grain="Corn", delivery_month=today.strftime("%Y-%m"),
+                                           futures_symbol="ZCZ27", basis_cents=-22, cash_price=4.1)])        # no clear range
+unclear = [x for x in data.list_suggestions(db, slug) if x["futures_symbol"] == "ZCZ27"][0]
+check(unclear["delivery_start"] is None, unclear)
+raises(lambda: data.review_suggestion(db, slug, S, unclear["suggestion_id"], True), "an unclear range must be entered")
+data.review_suggestion(db, slug, S, unclear["suggestion_id"], True, delivery_start=D(0), delivery_end=D(20))
+nb = [b for b in data.list_bids(db, slug) if b["futures_symbol"] == "ZCZ27"][0]
+check(str(nb["window_start"]) == D(0) and str(nb["window_end"]) == D(20), nb)
+check(isinstance(data.expire_all_tenants(db), int), "the all-tenants job runs")
 
 print("\nALL OK:", N, "steps; tenant", slug)

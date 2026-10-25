@@ -94,16 +94,25 @@ def test_staff_bid_board_has_post_controls(app_db):
 def test_farmer_makes_offer(app_db):
     at = _as(app_db, 1)
     at.radio[0].set_value("Make an offer").run()
-    assert not at.exception
+    assert not at.exception, at.exception
     send = lambda: next(b for b in at.button if b.label == "Send offer")
-    send().click().run()                                   # open price, no basis/symbol yet
-    assert at.error and "futures month" in at.error[0].value.lower()
-    next(t for t in at.text_input if t.label == "Futures month (e.g. ZCZ26)").set_value("zcz26")
-    next(n for n in at.number_input if n.label == "Basis (¢)").set_value(-30)
+    send().click().run()                                   # open price: no delivery period, no futures month yet
+    assert at.error and "delivery period" in at.error[0].value.lower()           # the delivery period sets when it expires
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 1)) == []
+    # Against a posted bid the delivery period (and symbol, basis) come from the bid, so it can be sent as it is.
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
+                     basis_cents=-30, cash_price=4.2)
+    at = _as(app_db, 1)
+    at.radio[0].set_value("Make an offer").run()
+    at.session_state["offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]                       # pick the bid (AppTest cannot drive a
+    at.run()                                                                                         # selectbox that has a format_func)
+    assert not at.exception, at.exception
+    assert [str(d.value) for d in at.date_input[:2]] == ["2999-12-01", "2999-12-31"]      # prefilled from the bid
     send().click().run()
-    assert not at.error
+    assert not at.error, [e.value for e in at.error]
     offer = data.list_offers(app_db, "rcm", conftest.user(app_db, 1))[0]
     assert (offer["futures_symbol"], offer["basis_cents"], offer["status"]) == ("ZCZ26", -30, "submitted")
+    assert str(offer["delivery_end"]) == "2999-12-31"
 
 
 def test_farmer_view_is_read_only_board(app_db):

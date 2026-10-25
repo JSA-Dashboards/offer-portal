@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS users (
     name           STRING,
     role           STRING       NOT NULL,
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
+    notify_email   BOOLEAN      DEFAULT TRUE,                -- offer / recap emails (NULL counts as on)
     invited_by     NUMBER(38,0),
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (user_id),
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS farmers (
     email          STRING,
     user_id        NUMBER(38,0),                    -- linked portal login, if any
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
+    notify_email   BOOLEAN      DEFAULT TRUE,                -- email this farmer about their offers (uses `email`)
     created_by     NUMBER(38,0),
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (farmer_id)
@@ -106,6 +108,8 @@ CREATE TABLE IF NOT EXISTS bid_suggestions (
     location_id    NUMBER(38,0),
     grain          STRING       NOT NULL,
     delivery_month STRING       NOT NULL,           -- e.g. '2026-12'
+    delivery_start DATE,                            -- the delivery date range; NULL = the scrape did not give a clear one
+    delivery_end   DATE,                            --   (an admin must enter one before the suggestion can be approved)
     futures_symbol STRING,
     basis_cents    NUMBER(38,0),
     cash_price     FLOAT,
@@ -139,6 +143,8 @@ CREATE TABLE IF NOT EXISTS bids (
     location_id    NUMBER(38,0),
     grain          STRING       NOT NULL,
     delivery_month STRING       NOT NULL,
+    delivery_start DATE,                            -- first / last day of the delivery period. An offer made against
+    delivery_end   DATE,                            -- this bid expires the day after delivery_end passes
     futures_symbol STRING,
     basis_cents    NUMBER(38,0),                    -- cents under/over the futures month
     cash_price     FLOAT,                           -- fixed cash price, when posted
@@ -155,10 +161,12 @@ CREATE TABLE IF NOT EXISTS bids (
 -- ── Offers ──────────────────────────────────────────────────────────────────
 -- contract_type: CASH | HTA | FUTURES_ONLY
 -- price_type:    FIXED | BASIS          (a basis offer needs futures_symbol)
--- status: submitted (outstanding) -> hit -> completed (archived)
---         or declined | withdrawn | expired.   No counter-offers.
--- hit        = the market reached the farmer's offer; the elevator now owns the grain and may need to hedge
--- completed  = contract number confirmed; the offer moves to the archive
+-- status: submitted (outstanding) -> hit -> acknowledged -> completed (archived)
+--         or declined | withdrawn | expired (before a hit), or cancelled (after a hit).   No counter-offers.
+-- hit          = the market reached the farmer's offer; the elevator now owns the grain and may need to hedge
+-- acknowledged = a staff member took it on (who / when are recorded)
+-- completed    = contract number entered on an acknowledged offer; the offer moves to the archive
+-- cancelled    = amended to cancelled after a hit: admins are told to adjust the hedge until they confirm it
 CREATE TABLE IF NOT EXISTS offers (
     offer_id       NUMBER(38,0) IDENTITY(1,1),
     tenant_id      STRING       NOT NULL,
@@ -184,8 +192,16 @@ CREATE TABLE IF NOT EXISTS offers (
     hit_by         NUMBER(38,0),                    -- NULL when hit automatically
     auto_hit       BOOLEAN      NOT NULL DEFAULT FALSE,
     auto_hit_rule_id NUMBER(38,0),                  -- the rule that fired
+    acknowledged_at TIMESTAMP_TZ,
+    acknowledged_by NUMBER(38,0),
     completed_at   TIMESTAMP_TZ,
     completed_by   NUMBER(38,0),
+    cancelled_at   TIMESTAMP_TZ,
+    cancelled_by   NUMBER(38,0),
+    cancel_reason  STRING,
+    hedge_adjust_needed BOOLEAN DEFAULT FALSE,      -- a cancelled hit offer: admin must adjust the hedge
+    hedge_adjusted_at TIMESTAMP_TZ,
+    hedge_adjusted_by NUMBER(38,0),
     hedged_at      TIMESTAMP_TZ,                    -- set when staff mark a hit offer as hedged
     hedged_by      NUMBER(38,0),
     bid_snapshot   VARIANT,                         -- posted bid at submission time
@@ -202,7 +218,7 @@ CREATE TABLE IF NOT EXISTS offer_events (
     tenant_id      STRING       NOT NULL,
     offer_id       NUMBER(38,0) NOT NULL,
     actor_user_id  NUMBER(38,0),                    -- NULL = system (expiry job, auto-hit)
-    event_type     STRING       NOT NULL,           -- submitted | hit | completed | hedged | basis_updated | declined | withdrawn | expired | details_updated
+    event_type     STRING       NOT NULL,           -- submitted | hit | acknowledged | completed | cancelled | hedged | hedge_adjusted | basis_updated | declined | withdrawn | expired | details_updated
     detail         VARIANT,                         -- terms at that moment
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
     PRIMARY KEY (event_id)
@@ -248,6 +264,49 @@ CREATE TABLE IF NOT EXISTS futures_quotes (
     source         STRING       NOT NULL DEFAULT 'massive',
     delayed        BOOLEAN      NOT NULL DEFAULT TRUE,
     PRIMARY KEY (symbol)
+);
+
+-- ── Email outbox: events queue a row, a sender (the app after an action, or notify_run.py on the droplet) sends it ──
+CREATE TABLE IF NOT EXISTS notifications (
+    notification_id NUMBER(38,0) NOT NULL,
+    tenant_id      STRING       NOT NULL,
+    kind           STRING       NOT NULL,           -- offer_submitted | offer_hit | offer_completed | offer_cancelled | ... | daily_recap
+    to_email       STRING       NOT NULL,
+    to_name        STRING,
+    user_id        NUMBER(38,0),
+    offer_id       NUMBER(38,0),
+    dedupe_key     STRING,                          -- one email per (tenant, key, address)
+    subject        STRING       NOT NULL,
+    body_html      STRING       NOT NULL,
+    status         STRING       NOT NULL DEFAULT 'queued',   -- queued | sent | failed
+    attempts       NUMBER(38,0) NOT NULL DEFAULT 0,
+    error          STRING,
+    created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    sent_at        TIMESTAMP_TZ,
+    PRIMARY KEY (notification_id)
+);
+
+-- ── What staff bought today, outside or inside the offer system (feeds the end-of-day recap) ────────────────────────
+CREATE TABLE IF NOT EXISTS purchases (
+    purchase_id    NUMBER(38,0) NOT NULL,
+    tenant_id      STRING       NOT NULL,
+    purchase_date  DATE         NOT NULL,           -- Central-time day the buy was logged for
+    staff_user_id  NUMBER(38,0) NOT NULL,
+    farmer_id      NUMBER(38,0),
+    counterparty   STRING       NOT NULL,           -- entity or person name as it should read on the recap
+    grain          STRING       NOT NULL,
+    bushels        NUMBER(38,0) NOT NULL,
+    price          FLOAT,                           -- flat $/bu
+    basis_cents    NUMBER(38,0),
+    futures_symbol STRING,
+    location_id    NUMBER(38,0),
+    delivery_location STRING,
+    delivery_period STRING,                         -- 'YYYY-MM'
+    contract_ref   STRING,
+    note           STRING,
+    voided_at      TIMESTAMP_TZ,
+    created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (purchase_id)
 );
 
 -- ── Admin audit + per-tenant billing usage ──────────────────────────────────

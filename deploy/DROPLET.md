@@ -25,6 +25,14 @@ database is ever rebuilt, comment the line out first or every run fails and page
 6. Optional heartbeat: create a healthchecks.io check `offer-portal-bid-scrape`, schedule `15 6,12 * * 1-5`
    (America/Chicago, 2 h grace). An auto-made check defaults to a 1-day period and false-alarms on weekends.
 
+## Other jobs (NOT installed yet: add after sql/06 is applied and the app is deployed)
+Each runs through `cron-alert` like the scraper. They need `GRAPH_ENV_FILE=/opt/basis-tracker/.env` in `/opt/offer-portal/.env`
+(that file holds the Graph settings) so the droplet can send email.
+- `*/5 * * * *`      `notify_run.py`  expire offers whose last delivery day has passed, then flush queued emails (retries too)
+- `0 17 * * 1-5`     `recap_run.py`   end-of-day recap emails, 5:00 pm Central (once per person per day, safe to re-run)
+- `*/5 7-15 * * 1-5` `futures_run.py` delayed futures quotes + auto-hit check (only once `MASSIVE_API_KEY` is set)
+Pull new code with the SQL already applied: `git pull` before `sql/06` is run would reference columns that do not exist yet.
+
 ## Deploy / update
 `git -C /opt/offer-portal pull --ff-only` and, if `deploy/requirements-droplet.txt` changed,
 `/opt/offer-portal/.venv/bin/pip install -r /opt/offer-portal/deploy/requirements-droplet.txt`.

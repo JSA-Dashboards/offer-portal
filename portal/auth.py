@@ -84,8 +84,22 @@ def verify_code(db: Db, email: str, code: str, tenant_id: str | None) -> dict | 
     return _allowed_user(db, email, tenant_id)
 
 
+def _graph_env() -> None:
+    """On the droplet the four GRAPH_* values live in the basis tracker's .env: GRAPH_ENV_FILE points there (as
+    yield-portal does), so there is one copy to rotate. Only GRAPH_* keys are read, and only if not already set."""
+    path = os.environ.get("GRAPH_ENV_FILE")
+    if not path or not os.path.exists(path):
+        return
+    for line in open(path, encoding="utf-8"):
+        k, _, v = line.partition("=")
+        k = k.strip()
+        if k.startswith("GRAPH_") and not os.environ.get(k):
+            os.environ[k] = v.strip().strip("\"'")
+
+
 def send_via_graph(to: str, subject: str, html: str) -> None:
     """App-only Graph sendMail, same four GRAPH_* settings as the basis tracker."""
+    _graph_env()
     import msal
     import requests
     app = msal.ConfidentialClientApplication(
@@ -103,5 +117,6 @@ def send_via_graph(to: str, subject: str, html: str) -> None:
 
 
 def graph_configured() -> bool:
+    _graph_env()
     return all(os.environ.get(k) for k in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
                                            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER"))

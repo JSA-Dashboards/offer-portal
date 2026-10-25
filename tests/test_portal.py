@@ -50,7 +50,10 @@ def test_suggestions_are_hidden_until_approved(db):
 
         data.review_suggestion(db, "dorans", 4, sid, True)
 
-    data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35)   # admin edits then approves
+    with pytest.raises(PortalError):                      # the source gave no delivery range: staff must enter one
+        data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35)
+    data.review_suggestion(db, "rcm", 2, sid, True, basis_cents=-35, delivery_start="2026-12-01",
+                           delivery_end="2026-12-31")   # admin edits then approves
 
     assert data.list_bids(db, "rcm")[0]["basis_cents"] == -35
 

@@ -10,13 +10,22 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 - **Offers:** farmers (or staff on their behalf) make offers. Lifecycle: **Outstanding -> Hit -> Completed**
   (completing requires a contract number and archives the offer), or Declined / Withdrawn / Expired.
   There are no counter-offers.
+- **Expiry:** an offer expires the day after the last day of its delivery period (its own dates, else the bid's range, else the
+  end of its start month). Scraped bids need a clear delivery range; when the source doesn't give one, staff must enter it before approving.
 - **Summary:** offers by commodity and delivery period, filterable by entity, individual, commodity, period.
 - **Auto-hit (admin only):** rules that mark an outstanding offer hit automatically when the posted bid reaches it
   (scope by location, commodity, contract type, largest offer). No active rules = never automatic.
+- **Hit -> acknowledge -> contract #:** a hit offer must be acknowledged by staff, then given a contract number to complete.
+  An offer cancelled after a hit emails admins to adjust the hedge and sits on the Hedge page until they confirm.
+- **Email:** an outbox (`portal/notify.py`) emails farmers, staff and admins on offer events (the app flushes it after an
+  action; `notify_run.py` on the droplet covers the rest). Everyone can switch their own notifications off.
+- **Purchases + daily recap:** staff log what they bought; each staff member gets their own end-of-day recap, admins the
+  whole company's (`recap_run.py`).
 - **Hedge (admin only):** contracts to hedge and at what prices (implied futures / basis), by futures month.
-- **Delayed futures (placeholder):** `portal/massive.py` + `futures_run.py` store delayed Massive quotes (needs `MASSIVE_API_KEY`; never run
-  against the live API yet). Bids are sticky: a quote never changes a bid, it only stages an "indicated cash" suggestion that an admin confirms.
-  Staff always see delayed quotes; farmers only if the tenant's `show_futures` switch is on. Every futures price carries a delayed-quote notice.
+- **Delayed futures (placeholder):** `portal/massive.py` + `futures_run.py` keep ONE latest delayed Massive quote per futures month (needs
+  `MASSIVE_API_KEY`; never run against the live API yet). The sticky part of a bid is its BASIS; the flat bid is futures + basis and moves
+  with every quote, and offers are compared with it to decide whether they were hit. No price history is stored: only a hit keeps the price
+  that triggered it. Farmers see the flat bid; the futures column only if the tenant's `show_futures` switch is on. Delayed-quote notice everywhere.
 - **Theme:** CFTC-COT look (`portal/theme.py`), standard JSA disclaimer at the bottom of every page, white-label header/footer slots
   (tenant logo, name, colors, support email) with JSA "Powered by" branding (`JSA_BRANDING` switch).
 - **Farmers:** customer records (client ID, entity, individual) that exist with or without a portal login.

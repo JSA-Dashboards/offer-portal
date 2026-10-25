@@ -43,9 +43,10 @@ DISCLAIMER = (
 
 # Shown wherever a futures price appears, and in the footer of any page that shows one.
 DELAYED_NOTICE = (
-    "Futures prices are delayed quotes, shown for reference only. They are not real-time, may differ from "
-    "the market, and must not be used to place or price a trade. A bid does not change when futures move: "
-    "it stays as posted until an elevator administrator updates and confirms it.")
+    "Futures prices, and the flat bids calculated from them, are based on delayed quotes. They are not real-time, "
+    "may differ from the market, and are shown for reference only. A flat bid is the futures price plus the posted "
+    "basis, so it moves with futures; the basis stays as posted until an elevator administrator updates and "
+    "confirms it.")
 
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
@@ -164,3 +165,22 @@ def tile_html(label: str, value: str, sub: str = "") -> str:
     s = f'<div class="tile-sub">{html.escape(sub)}</div>' if sub else ""
     return (f'<div class="tile"><div class="tile-label">{html.escape(label)}</div>'
             f'<div class="tile-value">{html.escape(value)}</div>{s}</div>')
+
+
+def email_html(tenant: dict | None, body_html: str) -> str:
+    """A simple, client-safe HTML email: tenant header, the message, the standard JSA disclaimer (as on every page).
+    `body_html` must already be escaped / trusted."""
+    t = tenant or {}
+    name = html.escape(t.get("name") or "Offer portal")
+    logo = _https(t.get("logo_url"))
+    head_logo = f'<img src="{html.escape(logo)}" alt="" style="height:34px;vertical-align:middle;margin-right:10px">' if logo else ""
+    powered = ('<div style="margin-top:6px;font-size:11px;color:#8a9199">Powered by John Stewart &amp; Associates</div>'
+               if JSA_BRANDING else "")
+    support = (f'<div style="font-size:12px;color:#5f7267">Questions: {html.escape(t["support_email"])}</div>'
+               if t.get("support_email") else "")
+    return (f'<div style="font-family:Segoe UI,Arial,sans-serif;max-width:640px;color:{TEXT}">'
+            f'<div style="border-bottom:3px solid {colors(t)["primary"]};padding-bottom:8px;margin-bottom:14px">'
+            f'{head_logo}<span style="font-family:Georgia,serif;font-size:20px;font-weight:600">{name}</span>{powered}</div>'
+            f'{body_html}{support}'
+            f'<div style="margin-top:22px;padding-top:10px;border-top:1px solid #e0e0e0;font-size:11px;line-height:1.4;'
+            f'color:#8a9199;text-align:justify">{DISCLAIMER} &copy; John Stewart &amp; Associates, Inc. {_year()}</div></div>')

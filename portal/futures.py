@@ -1,19 +1,18 @@
-"""futures.py — delayed futures quotes and the "indicated cash" they suggest. Quotes are market data (no
-tenant_id); everything that touches a tenant's bids stays tenant-scoped.
+"""futures.py — delayed futures quotes. Quotes are market data (no tenant_id); everything that touches a tenant's
+bids stays tenant-scoped.
 
-Bids are STICKY. A quote never changes a posted bid, an offer, a hit or a hedge number. The only thing a
-quote can do is stage a *suggestion* (futures + the bid's posted basis = indicated cash) in the same review
-queue the scrapers use; an elevator admin edits and confirms it, and only then does the bid change.
+How a bid moves (Kolten, 2026-10-25): the sticky part of a bid is its BASIS. Staff post or confirm a basis and it stays
+until they change it. The flat bid is futures + basis, so it moves with every delayed quote (data.live_flat). Offers are
+compared with that live flat bid to decide whether they were hit. A quote therefore never edits a stored bid; it only
+changes the computed flat price, and after each quote refresh the auto-hit rules run.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
 
 from . import massive
-from .data import _insert, list_bids, list_locations, sync_suggestions
+from .data import _insert, expire_all_tenants, run_auto_hit
 from .db import Db
-
-THRESHOLD = 0.0025            # indicated cash must differ from the posted cash by a quarter cent to be suggested
 
 
 def update_quotes(db: Db, quotes: dict[str, dict], source: str = "massive") -> int:
@@ -42,43 +41,17 @@ def latest_stamp(quotes: dict[str, dict]) -> str | None:
     return (max(stamps) + " UTC") if stamps else None
 
 
-def indicated_cash(bid: dict, quote: dict | None) -> float | None:
-    """Futures (delayed) + the bid's posted basis. None without a quote or a basis."""
-    if not quote or bid.get("basis_cents") is None or quote.get("price") is None:
-        return None
-    return round(float(quote["price"]) + bid["basis_cents"] / 100.0, 4)
-
-
 def wanted_symbols(db: Db) -> list[str]:
     """Every futures month that matters right now, across tenants: live bids and open (outstanding or hit) offers."""
     rows = db.query("SELECT futures_symbol AS s FROM bids WHERE active AND futures_symbol IS NOT NULL "
-                    "UNION SELECT futures_symbol FROM offers WHERE status IN ('submitted', 'hit') "
+                    "UNION SELECT futures_symbol FROM offers WHERE status IN ('submitted', 'hit', 'acknowledged') "
                     "AND futures_symbol IS NOT NULL")
     return sorted({r["s"] for r in rows if r["s"]})
 
 
-def suggest_cash_updates(db: Db, tenant_id: str, quotes: dict[str, dict] | None = None) -> dict:
-    """Stage 'indicated cash' suggestions for a tenant's live bids. Skipped when the tenant has an active
-    scrape source: its own site's cash bids are the better signal there. Never touches a bid."""
-    if db.query("SELECT 1 AS x FROM scrape_sources WHERE tenant_id = %s AND active", (tenant_id,)):
-        return dict(skipped="tenant has an active scrape source")
-    quotes = quotes if quotes is not None else list_quotes(db)
-    names = {l["location_id"]: l["name"] for l in list_locations(db, tenant_id)}
-    items = []
-    for b in list_bids(db, tenant_id):
-        cash = indicated_cash(b, quotes.get(b["futures_symbol"]))
-        if cash is None or b["location_id"] not in names:
-            continue
-        if b["cash_price"] is not None and abs(cash - b["cash_price"]) < THRESHOLD:
-            continue
-        items.append(dict(location_name=names[b["location_id"]], grain=b["grain"], delivery_month=b["delivery_month"],
-                          futures_symbol=b["futures_symbol"], basis_cents=b["basis_cents"], cash_price=cash))
-    return sync_suggestions(db, tenant_id, "massive:delayed", items) if items else dict(staged=0)
-
-
 def run_update(db: Db, fetch=massive.fetch_quotes) -> dict:
-    """The job: fetch delayed quotes for every needed futures month, store them, stage suggestions for each
-    active tenant. Without MASSIVE_API_KEY it does nothing (and says so); bids stay exactly as posted."""
+    """The job: fetch delayed quotes for every needed futures month, store them, then run each active tenant's
+    auto-hit rules against the new live flat bids. Without MASSIVE_API_KEY it does nothing (and says so)."""
     if fetch is massive.fetch_quotes and not massive.configured():
         return dict(status="not configured: set MASSIVE_API_KEY; bids stay as posted")
     symbols = wanted_symbols(db)
@@ -86,7 +59,8 @@ def run_update(db: Db, fetch=massive.fetch_quotes) -> dict:
         return dict(status="no futures months in use yet")
     quotes = fetch(symbols)
     stored = update_quotes(db, quotes)
+    expire_all_tenants(db)                                 # an offer whose delivery period ended is never hit
     tenants = db.query("SELECT tenant_id FROM tenants WHERE status = 'active' ORDER BY tenant_id")
-    out = {t["tenant_id"]: suggest_cash_updates(db, t["tenant_id"], list_quotes(db)) for t in tenants}
+    out = {t["tenant_id"]: dict(auto_hit=run_auto_hit(db, t["tenant_id"])) for t in tenants}
     return dict(status="ok", symbols=len(symbols), quotes=stored, tenants=out,
                 missing=sorted(set(symbols) - set(quotes)))

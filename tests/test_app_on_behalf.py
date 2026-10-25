@@ -16,6 +16,8 @@ def test_staff_view_lists_the_new_screens(app_db):
 
 
 def test_staff_adds_farmer_then_places_offer_for_them(app_db):
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
+                     basis_cents=-30, cash_price=4.2)
     at = _go(_as(app_db, 2), "Place offer")
     f = {t.label: t for t in at.text_input}
     f["Client ID (your account number)"].set_value("10442")
@@ -28,17 +30,19 @@ def test_staff_adds_farmer_then_places_offer_for_them(app_db):
     got = farmers.list_farmers(app_db, "rcm", 2)[0]
     assert (got["name"], got["client_id"], got["entity_name"], got["individual_name"]) == \
         ("Farmer Bros LLC (Pat Farmer)", "10442", "Farmer Bros LLC", "Pat Farmer")
-    # The new farmer is preselected, so the offer form is showing.
-    next(t for t in at.text_input if t.label == "Futures month (e.g. ZCZ26)").set_value("zcz26")
+    # The new farmer is preselected, so the offer form is showing. Against the bid, dates / symbol / basis prefill.
+    at.session_state[f"f{got['farmer_id']}_offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]
+    at.run()
+    assert not at.exception, at.exception
     next(t for t in at.text_input if t.label == "Contract reference # (optional)").set_value("HTA-118")
     next(t for t in at.text_area if t.label == "Notes").set_value("Deliver to the north bin")
-    next(n for n in at.number_input if n.label == "Basis (¢)").set_value(-30)
     next(b for b in at.button if b.label == "Enter offer").click().run()
     assert not at.exception, at.exception
     assert not at.error, [e.value for e in at.error]
     o = data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]
     assert (o["farmer_name"], o["placed_by"], o["status"], o["basis_cents"], o["contract_ref"], o["note"]) == \
         ("Farmer Bros LLC (Pat Farmer)", 2, "submitted", -30, "HTA-118", "Deliver to the north bin")
+    assert str(o["delivery_start"]) == "2999-12-01" and str(o["delivery_end"]) == "2999-12-31"
 
 
 def test_offer_card_shows_client_id_and_staff_can_edit_notes_and_contract_ref(app_db):

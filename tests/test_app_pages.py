@@ -36,12 +36,13 @@ def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app
     _hit_offer(app_db)
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT)
     at = _as(app_db, 2)
-    assert list(at.radio[1].options) == ["Outstanding (1)", "Hit (1)", "Completed (0)", "Closed (0)"]
+    assert list(at.radio[1].options) == ["Outstanding (1)", "Hit (1)", "Acknowledged (0)", "Completed (0)", "Closed (0)"]
     assert any("5,000 bu Corn" in m.value for m in at.markdown)
     assert any(b.label == "Mark hit" for b in at.button)                                  # outstanding stage
     at.radio[1].set_value("Hit").run()
     assert not at.exception, at.exception
-    assert any(b.label == "Complete and archive" for b in at.button)                      # hit stage
+    assert any(b.label == "Acknowledge" for b in at.button)                              # hit stage: acknowledge first
+    assert not any(b.label == "Complete and archive" for b in at.button)
 
 
 def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
@@ -49,9 +50,13 @@ def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
     at = _as(app_db, 2)
     at.radio[1].set_value("Hit").run()
     assert any("implied futures 4.6800" in m.value for m in at.markdown)
+    next(b for b in at.button if b.label == "Acknowledge").click().run()                # staff takes it on ...
+    assert not at.exception, at.exception
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"
+    at.radio[1].set_value("Acknowledged").run()                                          # ... then must enter the contract number
     next(b for b in at.button if b.label == "Complete and archive").click().run()
     assert at.error and "contract number" in at.error[0].value.lower()
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"   # still not completed
     next(t for t in at.text_input if t.label.startswith("Contract number")).set_value("C-5531")
     next(b for b in at.button if b.label == "Complete and archive").click().run()
     assert not at.exception, at.exception

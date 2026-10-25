@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from portal import data, futures, massive, theme
 from conftest import user
@@ -97,12 +97,12 @@ def test_fetch_quotes_chunks_and_sends_the_bearer_key():
     assert len(out) == len(syms) and len(calls) == 2 and all(c[1] == "Bearer k" for c in calls)   # 36 tickers -> 2 chunks of <=25
 
 
-# ── quotes are stored, bids are sticky ───────────────────────────────────────
+# ── quotes are stored; the flat bid is live (futures + sticky basis) ─────────────────────────
 def _bid(db, **kw):
     kw = {**dict(grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1, basis_cents=-38,
                  cash_price=4.18), **kw}
     data.publish_bid(db, "rcm", 2, **kw)
-    return data.list_bids(db, "rcm")[0]
+    return [b for b in data.list_bids(db, "rcm") if b["futures_symbol"] == kw["futures_symbol"]][0]
 
 
 def _q(price):
@@ -111,6 +111,11 @@ def _q(price):
 
 def _riverton(db):
     db.execute("INSERT INTO locations (location_id, tenant_id, name) VALUES (1, 'rcm', 'Riverton')")
+
+
+def _age_quotes(db, minutes):
+    db.execute("UPDATE futures_quotes SET fetched_at = %s",
+               ((datetime.now(timezone.utc) - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S"),))
 
 
 def test_quotes_are_stored_one_row_per_symbol(db):
@@ -123,56 +128,80 @@ def test_quotes_are_stored_one_row_per_symbol(db):
     assert "2026-10-25 15:00" in futures.latest_stamp(got)
 
 
-def test_a_futures_move_never_changes_a_posted_bid_an_offer_or_the_hedge(db):
+def test_flat_bid_is_futures_plus_the_sticky_basis_and_moves_with_every_quote(db):
+    _riverton(db)
+    bid = _bid(db)
+    assert (bid["flat_price"], bid["flat_source"]) == (4.18, "posted")             # no futures feed yet: as posted
+    futures.update_quotes(db, {"ZCZ26": _q(4.60)})
+    b = data.list_bids(db, "rcm")[0]
+    assert (b["flat_price"], b["flat_source"], b["quote_price"]) == (4.22, "futures", 4.60)       # 4.60 + (-0.38)
+    futures.update_quotes(db, {"ZCZ26": _q(5.50)})
+    assert data.list_bids(db, "rcm")[0]["flat_price"] == 5.12                      # follows futures, always
+    futures.update_quotes(db, {"ZCZ26": _q(4.10)})
+    assert data.list_bids(db, "rcm")[0]["flat_price"] == 3.72                      # ... down as well as up
+    stored = db.query("SELECT basis_cents, cash_price FROM bids WHERE bid_id = %s", (bid["bid_id"],))[0]
+    assert (stored["basis_cents"], stored["cash_price"]) == (-38, 4.18)           # the stored bid never changed
+    assert _bid(db, basis_cents=-30)["flat_price"] == 3.80                         # a confirmed new basis re-bases the flat bid
+    assert _bid(db, futures_symbol="ZSX26", grain="Soybeans", basis_cents=None, cash_price=11.8)["flat_source"] == "posted"   # cash-only bid
+
+
+def test_a_futures_move_changes_no_stored_bid_offer_implied_futures_or_hedge(db):
     _riverton(db)
     bid = _bid(db)
     data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])
 
     def snapshot():
-        b = data.list_bids(db, "rcm")
-        return ([(x["bid_id"], x["cash_price"], x["basis_cents"], x["active"]) for x in b], data.hedge_summary(db, "rcm", 2),
+        raw = db.query("SELECT bid_id, basis_cents, cash_price, active FROM bids ORDER BY bid_id")
+        return (raw, data.hedge_summary(db, "rcm", 2),
                 [(o["implied_futures"], o["status"]) for o in data.list_offers(db, "rcm", user(db, 2))])
     before = snapshot()
-    futures.update_quotes(db, {"ZCZ26": _q(5.50)})                      # a big rally
-    futures.suggest_cash_updates(db, "rcm")
-    assert snapshot() == before                                          # bid, offer, implied futures, hedge: all unchanged
+    futures.update_quotes(db, {"ZCZ26": _q(5.50)})                                 # a big rally
+    assert snapshot() == before
 
 
-def test_indicated_cash_is_staged_for_confirmation_and_only_then_published(db):
+def test_offers_are_compared_with_the_live_flat_bid(db):
     _riverton(db)
     bid = _bid(db)
-    futures.update_quotes(db, {"ZCZ26": _q(4.60)})                      # 4.60 + (-0.38) = 4.22 vs posted 4.18
-    assert futures.indicated_cash(bid, futures.list_quotes(db)["ZCZ26"]) == 4.22
-    assert futures.suggest_cash_updates(db, "rcm")["staged"] == 1
-    sug = data.list_suggestions(db, "rcm")
-    assert (sug[0]["cash_price"], sug[0]["basis_cents"], sug[0]["source"]) == (4.22, -38, "massive:delayed")
-    assert data.list_bids(db, "rcm")[0]["cash_price"] == 4.18            # still sticky
-    assert futures.suggest_cash_updates(db, "rcm")["staged"] == 0         # nothing new to suggest
+    oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])    # sells at 4.30
+    reached = lambda: [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["bid_reached"]
+    assert reached() is False                                                          # posted cash 4.18 < 4.30
+    futures.update_quotes(db, {"ZCZ26": _q(4.56)})                                    # live flat 4.18
+    assert reached() is False
+    futures.update_quotes(db, {"ZCZ26": _q(4.70)})                                    # live flat 4.32 >= 4.30
+    assert reached() is True
+    futures.update_quotes(db, {"ZCZ26": _q(4.60)})                                    # falls back to 4.22: no longer reached
+    assert reached() is False
+
+
+def test_a_stale_quote_prices_nothing_and_hits_nothing(db):
+    _riverton(db)
+    bid = _bid(db)
+    data.add_auto_hit_rule(db, "rcm", 2)
     futures.update_quotes(db, {"ZCZ26": _q(4.70)})
-    assert futures.suggest_cash_updates(db, "rcm")["staged"] == 1         # a newer quote supersedes the open suggestion
-    assert [s["cash_price"] for s in data.list_suggestions(db, "rcm")] == [4.32]
-    data.review_suggestion(db, "rcm", 2, data.list_suggestions(db, "rcm")[0]["suggestion_id"], True, cash_price=4.30)
-    live = data.list_bids(db, "rcm")
-    assert len(live) == 1 and live[0]["cash_price"] == 4.30               # the admin's edit, only after confirming
+    data.act_on_offer(db, "rcm", user(db, 2), data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "price": 9.99},
+                                                               bid_id=bid["bid_id"]), "decline")   # unrelated, just seeding
+    oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])
+    assert [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["status"] == "hit"   # fresh: hit
+    oid2 = data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "bushels": 6000}, bid_id=bid["bid_id"])
+    _age_quotes(db, data.QUOTE_MAX_AGE_MIN + 5)                                       # the feed has stopped
+    b = data.list_bids(db, "rcm")[0]
+    assert (b["flat_price"], b["flat_source"]) == (None, "stale")
+    assert data.run_auto_hit(db, "rcm") == 0
+    assert [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid2][0]["bid_reached"] is False
 
 
-def test_small_moves_and_scraped_tenants_get_no_suggestion(db):
+def test_run_update_hits_offers_the_new_flat_bid_reaches_only_when_a_rule_allows_it(db):
     _riverton(db)
-    _bid(db)
-    futures.update_quotes(db, {"ZCZ26": _q(4.5610)})                      # indicated 4.181 vs posted 4.18: under a quarter cent
-    assert futures.suggest_cash_updates(db, "rcm")["staged"] == 0
-    futures.update_quotes(db, {"ZCZ26": _q(5.00)})
-    db.execute("INSERT INTO scrape_sources (tenant_id, kind, url) VALUES ('rcm', 'agricharts', 'https://x.example')")
-    assert "skipped" in futures.suggest_cash_updates(db, "rcm")           # its own site's bids are the better signal
-    assert data.list_suggestions(db, "rcm") == []
-
-
-def test_suggestions_are_tenant_scoped(db):
-    _riverton(db)
-    _bid(db)
-    futures.update_quotes(db, {"ZCZ26": _q(5.0)})
-    futures.suggest_cash_updates(db, "rcm")
-    assert data.list_suggestions(db, "dorans") == [] and len(data.list_suggestions(db, "rcm")) == 1
+    bid = _bid(db)
+    oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])    # sells at 4.30
+    status = lambda: [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["status"]
+    out = futures.run_update(db, fetch=lambda syms: {"ZCZ26": _q(4.70)})
+    assert out["status"] == "ok" and out["tenants"]["rcm"] == {"auto_hit": 0} and status() == "submitted"   # no rule: flagged only
+    data.add_auto_hit_rule(db, "rcm", 2)                                                # adding the rule hits it at once
+    assert status() == "hit"
+    ev = db.query("SELECT detail FROM offer_events WHERE offer_id = %s AND event_type = 'hit'", (oid,))[0]["detail"]
+    assert '"auto_hit": true' in ev and '"bid_flat_price": 4.32' in ev and '"flat_source": "futures"' in ev   # the live flat bid that triggered it
+    assert '"futures_quote": 4.7' in ev
 
 
 def test_run_update_without_a_key_changes_nothing(db, monkeypatch):
@@ -180,7 +209,7 @@ def test_run_update_without_a_key_changes_nothing(db, monkeypatch):
     _riverton(db)
     _bid(db)
     assert futures.run_update(db)["status"].startswith("not configured")
-    assert db.query("SELECT COUNT(*) AS n FROM futures_quotes")[0]["n"] == 0 and data.list_suggestions(db, "rcm") == []
+    assert db.query("SELECT COUNT(*) AS n FROM futures_quotes")[0]["n"] == 0
 
 
 def test_run_update_fetches_only_months_in_use_and_reports_gaps(db):
@@ -190,55 +219,78 @@ def test_run_update_fetches_only_months_in_use_and_reports_gaps(db):
     seen = []
     out = futures.run_update(db, fetch=lambda syms: (seen.append(syms), {"ZCZ26": _q(4.60)})[1])
     assert seen == [["ZCZ26", "ZSX26"]] and out["status"] == "ok" and out["missing"] == ["ZSX26"] and out["quotes"] == 1
-    assert out["tenants"]["rcm"]["staged"] == 1
 
 
-# ── UI: delayed futures shown with the notice, and farmers only when switched on ──
+# ── UI: the flat bid is shown to everyone with the notice; the futures column only when switched on ──
 def _app_bid(app_db):
     app_db.execute("INSERT INTO locations (location_id, tenant_id, name) VALUES (2, 'rcm', 'RPA')")
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-38, cash_price=4.18)
 
 
-def test_staff_see_delayed_futures_with_the_notice_and_the_footer_repeats_it(app_db):
+def test_staff_see_the_live_flat_bid_delayed_futures_and_the_notice(app_db):
     _app_bid(app_db)
     futures.update_quotes(app_db, {"ZCZ26": _q(4.60)})
     at = _as(app_db, 2)
     at.radio[0].set_value("Bid board").run()
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
-    assert "Delayed futures." in text and "Delayed quotes." in text            # banner + footer
-    assert "stays as posted until an elevator administrator updates and confirms" in text
+    assert "Delayed futures." in text and "Delayed quotes." in text                    # banner + footer
+    assert "the basis stays as posted until an elevator administrator updates and confirms" in text
     df = at.dataframe[0].value
-    assert list(df["Futures, delayed ($/bu)"]) == [4.60] and list(df["Indicated cash ($/bu)"]) == [4.22]
-    assert list(df["Cash ($/bu)"]) == [4.18]                                    # the posted bid is unchanged
+    assert list(df["Flat bid ($/bu)"]) == [4.22] and list(df["Basis (¢)"]) == [-38]
+    assert list(df["Futures, delayed ($/bu)"]) == [4.60] and list(df["Flat bid from"]) == ["futures + basis (delayed)"]
 
 
-def test_farmers_see_futures_only_when_the_tenant_allows_it(app_db):
+def test_farmers_see_the_flat_bid_but_futures_only_when_the_tenant_allows_it(app_db):
     _app_bid(app_db)
     futures.update_quotes(app_db, {"ZCZ26": _q(4.60)})
+    at = _as(app_db, 1)
+    assert "Delayed futures." in "".join(m.value for m in at.markdown)                 # a flat bid from futures carries the notice
+    df = at.dataframe[0].value
+    assert list(df["Flat bid ($/bu)"]) == [4.22] and "Futures, delayed ($/bu)" not in df.columns
+    app_db.execute("UPDATE tenants SET show_futures = 1 WHERE tenant_id = 'rcm'")
+    assert "Futures, delayed ($/bu)" in _as(app_db, 1).dataframe[0].value.columns
+
+
+def test_a_bid_with_no_futures_feed_shows_as_posted_and_no_banner(app_db):
+    _app_bid(app_db)
     at = _as(app_db, 1)
     assert "Delayed futures." not in "".join(m.value for m in at.markdown)
-    assert "Futures, delayed ($/bu)" not in at.dataframe[0].value.columns
-    app_db.execute("UPDATE tenants SET show_futures = 1 WHERE tenant_id = 'rcm'")
-    at = _as(app_db, 1)
-    assert "Delayed futures." in "".join(m.value for m in at.markdown)
-    assert "Futures, delayed ($/bu)" in at.dataframe[0].value.columns
+    df = at.dataframe[0].value
+    assert list(df["Flat bid ($/bu)"]) == [4.18] and list(df["Flat bid from"]) == ["as posted"]
 
 
-def test_review_screen_shows_the_posted_bid_next_to_a_futures_suggestion_and_edits_cash(app_db):
+def test_review_screen_edits_the_basis_and_posts_it_with_the_scraped_delivery_range(app_db):
     _app_bid(app_db)
-    futures.update_quotes(app_db, {"ZCZ26": _q(4.60)})
-    futures.suggest_cash_updates(app_db, "rcm")
+    data.stage_suggestion(app_db, "rcm", grain="Corn", delivery_month="2999-12", source="agricharts", location_id=1,
+                          futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21,
+                          delivery_start="2999-12-01", delivery_end="2999-12-15")           # the source gave a clear range
     at = _as(app_db, 2)
     at.radio[0].set_value("Review scraped bids").run()
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
-    assert "From delayed futures 4.6000" in text and "Posted now: \\$4.18" in text        # $ escaped so it never becomes math
-    next(n for n in at.number_input if n.label == "Cash ($/bu)").set_value(4.25)
+    assert "Posted now: basis -38¢" in text and "Delivery Dec 01 – Dec 15, 2999" in text
+    assert not any(n.label == "Cash ($/bu)" for n in at.number_input)
+    next(n for n in at.number_input if n.label == "Basis (¢)").set_value(-33)
     next(b for b in at.button if b.label == "Approve").click().run()
     assert not at.exception, at.exception
-    assert data.list_bids(app_db, "rcm")[0]["cash_price"] == 4.25
+    assert not at.error, [e.value for e in at.error]
+    b = data.list_bids(app_db, "rcm")[0]
+    assert (b["basis_cents"], str(b["window_start"]), str(b["window_end"])) == (-33, "2999-12-01", "2999-12-15")
+
+
+def test_review_screen_refuses_to_approve_a_suggestion_with_no_clear_delivery_range(app_db):
+    _app_bid(app_db)
+    data.stage_suggestion(app_db, "rcm", grain="Corn", delivery_month="2999-12", source="bushelsites", location_id=1,
+                          futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21)          # e.g. a "Harvest 2026" label
+    at = _as(app_db, 2)
+    at.radio[0].set_value("Review scraped bids").run()
+    assert "gave no clear delivery range" in "".join(m.value for m in at.markdown)
+    next(b for b in at.button if b.label == "Approve").click().run()
+    assert not at.exception, at.exception
+    assert at.error and "delivery date range" in at.error[0].value                           # staff must enter one
+    assert data.list_bids(app_db, "rcm")[0]["basis_cents"] == -38 and len(data.list_suggestions(app_db, "rcm")) == 1
 
 
 def test_platform_admin_can_switch_on_futures_for_farmers(app_db):

@@ -10,29 +10,38 @@ CREATE TABLE auto_hit_rules (rule_id INTEGER PRIMARY KEY, tenant_id TEXT, locati
   created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE futures_quotes (symbol TEXT PRIMARY KEY, price REAL, as_of TEXT,
   fetched_at TEXT DEFAULT CURRENT_TIMESTAMP, source TEXT DEFAULT 'massive', delayed INT DEFAULT 1);
+CREATE TABLE notifications (notification_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, to_email TEXT, to_name TEXT,
+  user_id INT, offer_id INT, dedupe_key TEXT, subject TEXT, body_html TEXT, status TEXT DEFAULT 'queued', attempts INT DEFAULT 0,
+  error TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, sent_at TEXT);
+CREATE TABLE purchases (purchase_id INTEGER PRIMARY KEY, tenant_id TEXT, purchase_date TEXT, staff_user_id INT, farmer_id INT,
+  counterparty TEXT, grain TEXT, bushels INT, price REAL, basis_cents INT, futures_symbol TEXT, location_id INT,
+  delivery_location TEXT, delivery_period TEXT, contract_ref TEXT, note TEXT, voided_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE scrape_sources (source_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, url TEXT,
   location_name TEXT, active INT DEFAULT 1, last_run_at TEXT, last_status TEXT);
 CREATE TABLE farmers (farmer_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, client_id TEXT, entity_name TEXT,
   individual_name TEXT, phone TEXT, email TEXT,
-  user_id INT, active INT DEFAULT 1, created_by INT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+  user_id INT, active INT DEFAULT 1, notify_email INT DEFAULT 1, created_by INT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE invites (token_hash TEXT PRIMARY KEY, tenant_id TEXT, email TEXT, role TEXT DEFAULT 'farmer',
   invited_by INT, farmer_id INT, expires_at TEXT, used INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE tenants (tenant_id TEXT PRIMARY KEY, name TEXT, status TEXT DEFAULT 'active', logo_url TEXT,
   primary_color TEXT, accent_color TEXT, support_email TEXT, from_name TEXT,
   hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, show_futures INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE locations (location_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, state TEXT, active INT DEFAULT 1);
-CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT);
+CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT, notify_email INT DEFAULT 1);
 CREATE TABLE bid_suggestions (suggestion_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, grain TEXT,
-  delivery_month TEXT, futures_symbol TEXT, basis_cents INT, cash_price REAL, source TEXT,
+  delivery_month TEXT, delivery_start TEXT, delivery_end TEXT, futures_symbol TEXT, basis_cents INT, cash_price REAL, source TEXT,
   scraped_at TEXT DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'suggested', reviewed_by INT, reviewed_at TEXT);
 CREATE TABLE bids (bid_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, grain TEXT, delivery_month TEXT,
+  delivery_start TEXT, delivery_end TEXT,
   futures_symbol TEXT, basis_cents INT, cash_price REAL, bushel_cap INT, effective_date TEXT, expires_at TEXT,
   source_suggestion_id INT, published_by INT, published_at TEXT DEFAULT CURRENT_TIMESTAMP, active INT DEFAULT 1);
 CREATE TABLE offers (offer_id INTEGER PRIMARY KEY, tenant_id TEXT, farmer_id INT, farmer_user_id INT, placed_by INT, location_id INT, bid_id INT,
   grain TEXT, contract_type TEXT, price_type TEXT, bushels INT, price REAL, basis_cents INT, futures_symbol TEXT,
   delivery_start TEXT, delivery_end TEXT, note TEXT, contract_ref TEXT, basis_ref_cents INT, implied_futures REAL,
   hit_at TEXT, hit_by INT, auto_hit INT DEFAULT 0, auto_hit_rule_id INT,
-  completed_at TEXT, completed_by INT, hedged_at TEXT, hedged_by INT, bid_snapshot TEXT, status TEXT, expires_at TEXT,
+  acknowledged_at TEXT, acknowledged_by INT, completed_at TEXT, completed_by INT, cancelled_at TEXT, cancelled_by INT,
+  cancel_reason TEXT, hedge_adjust_needed INT DEFAULT 0, hedge_adjusted_at TEXT, hedge_adjusted_by INT,
+  hedged_at TEXT, hedged_by INT, bid_snapshot TEXT, status TEXT, expires_at TEXT,
   created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE offer_events (event_id INTEGER PRIMARY KEY, tenant_id TEXT, offer_id INT, actor_user_id INT,
   event_type TEXT, detail TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);

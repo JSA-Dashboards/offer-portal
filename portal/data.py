@@ -7,10 +7,11 @@ platform users) are at the bottom and are for platform_admin only.
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from .db import Db
@@ -26,11 +27,12 @@ ELEVATOR_ROLES = ("elevator_admin", "elevator_staff")
 _TRANSITIONS = {
     "submitted": {"hit": ("hit", ELEVATOR_ROLES), "decline": ("declined", ELEVATOR_ROLES),
                   "withdraw": ("withdrawn", ("farmer",)), "expire": ("expired", ())},
-}                                     # hit -> completed goes through complete_offer (needs a contract number)
+}                                     # hit -> acknowledged -> completed: acknowledge_offer / complete_offer; cancel_offer after a hit
 
 CONTRACT_BUSHELS = {"Corn": 5000, "Soybeans": 5000, "Wheat": 5000}     # CBOT futures contract size
-STATUS_LABELS = {"submitted": "Outstanding", "hit": "Hit", "completed": "Completed",
-                 "declined": "Declined", "withdrawn": "Withdrawn", "expired": "Expired"}
+STATUS_LABELS = {"submitted": "Outstanding", "hit": "Hit", "acknowledged": "Acknowledged", "completed": "Completed",
+                 "declined": "Declined", "withdrawn": "Withdrawn", "expired": "Expired", "cancelled": "Cancelled"}
+HELD = ("hit", "acknowledged")        # the elevator owns the grain and the hedge question is open
 
 
 class PortalError(ValueError):
@@ -62,6 +64,25 @@ def new_id() -> int:
 _EPOCH_MS = 1_767_225_600_000        # 2026-01-01T00:00:00Z
 _LAST_ID = 0
 _ID_LOCK = threading.Lock()
+
+
+def _notify(db: Db, tenant_id: str, kind: str, offer_id: int, **ctx) -> None:
+    """Queue the email(s) for an offer event. Best effort: a notification problem must never undo or block the
+    action that caused it (the portal/notify.py outbox is added separately; until then this does nothing)."""
+    try:
+        from . import notify
+    except ImportError:
+        return
+    try:
+        notify.offer_event(db, tenant_id, kind, offer_id, **ctx)
+    except Exception:                                   # pragma: no cover - never break the caller
+        pass
+
+
+def portal_link(tenant_id: str) -> str:
+    """The tenant's portal address for emails ('' when OFFER_PORTAL_URL is not set)."""
+    base = os.environ.get("OFFER_PORTAL_URL", "").rstrip("/")
+    return f"{base}/?t={tenant_id}" if base and tenant_id else ""
 
 
 def today_ct():
@@ -106,13 +127,54 @@ def get_user_by_email(db: Db, email: str) -> dict | None:
 
 
 # ── Bid board (published) and scraper staging ───────────────────────────────
+QUOTE_MAX_AGE_MIN = 60      # a delayed quote older than this is not used to price a bid (the job has stopped)
+
+
+def _quote_fresh(q: dict, now=None) -> bool:
+    from datetime import timezone
+    from .auth import _as_utc
+    stamp = q.get("fetched_at") or q.get("as_of")
+    if stamp is None:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return (now - _as_utc(stamp)).total_seconds() <= QUOTE_MAX_AGE_MIN * 60
+
+
+def live_flat(bid: dict, quote: dict | None, now=None) -> tuple[float | None, str]:
+    """The flat price a bid is paying right now, and where it came from.
+
+    The sticky part of a bid is its BASIS (it changes only when staff post or confirm a new one). The flat bid is
+    futures + basis and moves with every delayed quote:
+      ('futures')  fresh quote for the bid's futures month  -> round(futures + basis/100, 4)
+      ('stale')    a quote exists but is older than QUOTE_MAX_AGE_MIN -> None: never priced (or hit) off a dead feed
+      ('posted')   no futures feed for that month (or a cash-only bid) -> the cash price as posted / scraped
+    """
+    basis = bid.get("basis_cents")
+    if basis is not None and quote and quote.get("price") is not None:
+        if _quote_fresh(quote, now):
+            return round(float(quote["price"]) + basis / 100.0, 4), "futures"
+        return None, "stale"
+    return bid.get("cash_price"), "posted"
+
+
 def list_bids(db: Db, tenant_id: str, grain: str | None = None) -> list[dict]:
+    """Live bids, each annotated with flat_price / flat_source (see live_flat) and the quote it used."""
     sql = "SELECT * FROM bids WHERE tenant_id = %s AND active"
     params: list = [tenant_id]
     if grain:
         sql += " AND grain = %s"
         params.append(grain)
-    return db.query(sql + " ORDER BY grain, delivery_month", tuple(params))
+    rows = db.query(sql + " ORDER BY grain, delivery_month", tuple(params))
+    syms = {b["futures_symbol"] for b in rows if b["futures_symbol"]}
+    quotes = ({q["symbol"]: q for q in db.query("SELECT symbol, price, as_of, fetched_at FROM futures_quotes")
+               if q["symbol"] in syms} if syms else {})
+    for b in rows:
+        q = quotes.get(b["futures_symbol"])
+        b["flat_price"], b["flat_source"] = live_flat(b, q)
+        b["quote_price"] = q["price"] if q else None
+        b["quote_as_of"] = (q.get("as_of") or q.get("fetched_at")) if q else None
+        b["window_start"], b["window_end"] = bid_window(b)
+    return rows
 
 
 def _require_staff(db: Db, tenant_id: str, actor_id: int) -> None:
@@ -132,17 +194,24 @@ def retire_bid(db: Db, tenant_id: str, actor_id: int, bid_id: int) -> None:
 
 def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_month: str,
                 location_id=None, futures_symbol=None, basis_cents=None, cash_price=None,
-                bushel_cap=None, expires_at=None, source_suggestion_id=None) -> int:
+                bushel_cap=None, expires_at=None, source_suggestion_id=None,
+                delivery_start=None, delivery_end=None) -> int:
     """Publish a bid. It replaces the live bid for the same slot (location, grain, delivery month,
     futures month). Returns a PublishResult: how many outstanding flat-price offers had their implied
     futures re-computed because the basis moved, and (.auto_hit) how many offers it then hit."""
     _require_staff(db, tenant_id, actor_id)
     if basis_cents is None and cash_price is None:
         raise PortalError("A bid needs a basis or a cash price.")
+    mb = month_bounds(delivery_month)
+    if mb is None:
+        raise PortalError("The delivery month must look like 2026-12.")
+    ds, de = _to_date(delivery_start) or mb[0], _to_date(delivery_end) or mb[1]   # no dates given: the whole month
+    if de < ds:
+        raise PortalError("The delivery range ends before it starts.")
     bid_id = new_id()
     _insert(db, "bids", dict(
         bid_id=bid_id, tenant_id=tenant_id, location_id=location_id, grain=grain, delivery_month=delivery_month,
-        futures_symbol=futures_symbol, basis_cents=basis_cents, cash_price=cash_price,
+        delivery_start=ds.isoformat(), delivery_end=de.isoformat(), futures_symbol=futures_symbol, basis_cents=basis_cents, cash_price=cash_price,
         bushel_cap=bushel_cap, effective_date=today_ct().isoformat(), expires_at=expires_at,
         source_suggestion_id=source_suggestion_id, published_by=actor_id))
     new_bid_id = bid_id
@@ -165,10 +234,16 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
 
 
 def stage_suggestion(db: Db, tenant_id: str, *, grain: str, delivery_month: str, source: str,
-                     location_id=None, futures_symbol=None, basis_cents=None, cash_price=None) -> None:
-    """Scraper entry point: lands as 'suggested'; farmers never see it."""
+                     location_id=None, futures_symbol=None, basis_cents=None, cash_price=None,
+                     delivery_start=None, delivery_end=None) -> None:
+    """Scraper entry point: lands as 'suggested'; farmers never see it. delivery_start/end are None when the source did
+    not give a clear delivery range: an admin must then enter one before approving."""
+    ds, de = _to_date(delivery_start), _to_date(delivery_end)
+    if not (ds and de and de >= ds):
+        ds = de = None
     _insert(db, "bid_suggestions", dict(
         tenant_id=tenant_id, location_id=location_id, grain=grain, delivery_month=delivery_month,
+        delivery_start=ds.isoformat() if ds else None, delivery_end=de.isoformat() if de else None,
         futures_symbol=futures_symbol, basis_cents=basis_cents, cash_price=cash_price, source=source))
 
 
@@ -205,7 +280,8 @@ def sync_suggestions(db: Db, tenant_id: str, source: str, items: list[dict]) -> 
                        "AND tenant_id = %s", (openq[key]["suggestion_id"], tenant_id))
         stage_suggestion(db, tenant_id, grain=it["grain"], delivery_month=it["delivery_month"],
                          source=source, location_id=lid, futures_symbol=it["futures_symbol"],
-                         basis_cents=it["basis_cents"], cash_price=it["cash_price"])
+                         basis_cents=it["basis_cents"], cash_price=it["cash_price"],
+                         delivery_start=it.get("delivery_start"), delivery_end=it.get("delivery_end"))
         n["staged"] += 1
     return n
 
@@ -227,11 +303,16 @@ def review_suggestion(db: Db, tenant_id: str, actor_id: int, suggestion_id: int,
     s = r[0]
     repriced = 0
     if approve:
+        ds = _to_date(overrides.get("delivery_start")) or _to_date(s.get("delivery_start"))
+        de = _to_date(overrides.get("delivery_end")) or _to_date(s.get("delivery_end"))
+        if not (ds and de):
+            raise PortalError("Enter the delivery date range (from and to) before approving: the source did not give a "
+                              "clear one, and offers expire when it ends.")
         repriced = publish_bid(db, tenant_id, actor_id, grain=s["grain"], delivery_month=s["delivery_month"],
                     location_id=s["location_id"], futures_symbol=s["futures_symbol"],
                     basis_cents=overrides.get("basis_cents", s["basis_cents"]),
                     cash_price=overrides.get("cash_price", s["cash_price"]),
-                    source_suggestion_id=suggestion_id)
+                    source_suggestion_id=suggestion_id, delivery_start=ds, delivery_end=de)
     db.execute("UPDATE bid_suggestions SET status = %s, reviewed_by = %s, reviewed_at = CURRENT_TIMESTAMP() "
                "WHERE suggestion_id = %s AND tenant_id = %s",
                ("approved" if approve else "discarded", actor_id, suggestion_id, tenant_id))
@@ -242,6 +323,64 @@ def review_suggestion(db: Db, tenant_id: str, actor_id: int, suggestion_id: int,
 # ── Pricing reference: which posted bid prices an offer, and the implied futures ──────────
 def _month_of(d) -> str | None:
     return str(d)[:7] if d else None
+
+
+def _to_date(v) -> date | None:
+    """A date from a date / datetime / 'YYYY-MM-DD...' string (Snowflake returns dates, sqlite text); None if unusable."""
+    if v is None or v == "":
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
+
+
+def month_bounds(ym: str) -> tuple[date, date] | None:
+    """('2026-12') -> (2026-12-01, 2026-12-31); None when it isn't YYYY-MM."""
+    try:
+        y, m = int(ym[:4]), int(ym[5:7])
+        first = date(y, m, 1)
+    except (ValueError, TypeError, IndexError):
+        return None
+    nxt = date(y + (m == 12), 1 if m == 12 else m + 1, 1)
+    return first, date.fromordinal(nxt.toordinal() - 1)
+
+
+def bid_window(b: dict) -> tuple[date | None, date | None]:
+    """A bid's delivery range: its own dates, else the whole of its delivery month."""
+    s, e = _to_date(b.get("delivery_start")), _to_date(b.get("delivery_end"))
+    if s and e:
+        return s, e
+    mb = month_bounds(b.get("delivery_month") or "")
+    return mb if mb else (s, e)
+
+
+def offer_delivery_end(o: dict) -> date | None:
+    """The last day of the offer's delivery period (its offer expires the day after): the offer's own delivery_end,
+    else the end of the bid it was made against (as it was at submission), else the end of its delivery_start month.
+    None when nothing says."""
+    d = _to_date(o.get("delivery_end"))
+    if d:
+        return d
+    snap = o.get("bid_snapshot")
+    if isinstance(snap, str):
+        try:
+            snap = json.loads(snap)
+        except ValueError:
+            snap = None
+    if snap:
+        d = _to_date(snap.get("delivery_end"))
+        if d:
+            return d
+        mb = month_bounds(snap.get("delivery_month") or "")
+        if mb:
+            return mb[1]
+    start = _to_date(o.get("delivery_start"))
+    return month_bounds(start.strftime("%Y-%m"))[1] if start else None
 
 
 def _reference_bid(offer: dict, bids: list[dict]) -> dict | None:
@@ -311,7 +450,8 @@ def bid_reached(offer: dict, bid: dict | None) -> bool:
     if bid is None or offer["status"] != "submitted":
         return False
     if offer["price_type"] == "FIXED":
-        return bid["cash_price"] is not None and offer["price"] is not None and bid["cash_price"] >= offer["price"]
+        flat = bid["flat_price"] if "flat_price" in bid else bid.get("cash_price")      # live: futures + basis
+        return flat is not None and offer["price"] is not None and flat >= offer["price"]
     return bid["basis_cents"] is not None and offer["basis_cents"] is not None and bid["basis_cents"] >= offer["basis_cents"]
 
 
@@ -399,6 +539,9 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         t = get_tenant(db, tenant_id)
         if not t or not t["open_pricing"]:
             raise PortalError("This elevator only accepts offers against posted bids.")
+    end = offer_delivery_end(dict(delivery_end=delivery_end, delivery_start=delivery_start, bid_snapshot=snapshot))
+    if end is not None and end < today_ct():
+        raise PortalError("That delivery period has already ended.")
     ref = _reference_bid(dict(bid_id=bid_id, grain=grain, futures_symbol=futures_symbol, location_id=location_id,
                               delivery_start=delivery_start), list_bids(db, tenant_id))
     ref_basis = ref["basis_cents"] if (ref and price_type == "FIXED") else None
@@ -418,6 +561,7 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         detail=dict(bushels=bushels, price=price, basis_cents=basis_cents,
                     on_behalf=placed_by is not None)), ("detail",))
     _usage(db, tenant_id, "offer_submitted", oid)
+    _notify(db, tenant_id, "offer_submitted", oid)
     _auto_hit_one(db, tenant_id, db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s",
                                           (oid, tenant_id))[0], list_bids(db, tenant_id), _auto_rules(db, tenant_id))
     return oid
@@ -445,9 +589,13 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
     sql = ("SELECT o.*, f.name AS farmer_name, f.email AS farmer_email, f.phone AS farmer_phone, "
            "f.client_id AS farmer_client_id, f.entity_name AS farmer_entity, "
            "f.individual_name AS farmer_individual, "
-           "pb.name AS placed_by_name, pb.email AS placed_by_email FROM offers o "
+           "pb.name AS placed_by_name, pb.email AS placed_by_email, "
+           "ab.name AS acknowledged_by_name, ab.email AS acknowledged_by_email, "
+           "cb.name AS cancelled_by_name, cb.email AS cancelled_by_email FROM offers o "
            "LEFT JOIN farmers f ON f.farmer_id = o.farmer_id "
-           "LEFT JOIN users pb ON pb.user_id = o.placed_by WHERE o.tenant_id = %s")
+           "LEFT JOIN users pb ON pb.user_id = o.placed_by "
+           "LEFT JOIN users ab ON ab.user_id = o.acknowledged_by "
+           "LEFT JOIN users cb ON cb.user_id = o.cancelled_by WHERE o.tenant_id = %s")
     params: list = [tenant_id]
     if user["role"] == "farmer":
         sql += " AND f.user_id = %s"
@@ -483,41 +631,74 @@ def bid_gap(offer: dict) -> str:
 
 
 def expire_stale(db: Db, tenant_id: str) -> int:
-    """Mark open offers past their expires_at as expired (run on page load; cheap)."""
+    """Expire outstanding offers that are past their good-until time, or whose delivery period is over (the last
+    delivery day has passed: the offer lives through that day and expires the next). Cheap; runs on page loads and
+    from the jobs. Hit offers are never expired: only outstanding ones."""
     from datetime import timezone
     from .auth import _as_utc
-    now = datetime.now(timezone.utc)
-    n = 0
-    for o in db.query("SELECT offer_id, expires_at FROM offers WHERE tenant_id = %s AND expires_at IS NOT NULL "
-                      "AND status = 'submitted'", (tenant_id,)):
-        if _as_utc(o["expires_at"]) <= now:
-            db.execute("UPDATE offers SET status = 'expired', updated_at = CURRENT_TIMESTAMP() "
-                       "WHERE offer_id = %s AND tenant_id = %s", (o["offer_id"], tenant_id))
-            _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=o["offer_id"],
-                                             actor_user_id=None, event_type="expired", detail={}), ("detail",))
-            n += 1
+    now, today, n = datetime.now(timezone.utc), today_ct(), 0
+    for o in db.query("SELECT offer_id, expires_at, delivery_start, delivery_end, bid_snapshot FROM offers "
+                      "WHERE tenant_id = %s AND status = 'submitted'", (tenant_id,)):
+        end = offer_delivery_end(o)
+        if o["expires_at"] is not None and _as_utc(o["expires_at"]) <= now:
+            reason = "good_until"
+        elif end is not None and end < today:
+            reason = "delivery_period_ended"
+        else:
+            continue
+        db.execute("UPDATE offers SET status = 'expired', updated_at = CURRENT_TIMESTAMP() "
+                   "WHERE offer_id = %s AND tenant_id = %s", (o["offer_id"], tenant_id))
+        _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=o["offer_id"], actor_user_id=None,
+                                         event_type="expired", detail=dict(
+                                             reason=reason, delivery_end=str(end) if end else None)), ("detail",))
+        _notify(db, tenant_id, "offer_expired", o["offer_id"])
+        n += 1
     return n
+
+
+def expire_all_tenants(db: Db) -> int:
+    """The job form of expire_stale: every active tenant."""
+    return sum(expire_stale(db, t["tenant_id"]) for t in
+               db.query("SELECT tenant_id FROM tenants WHERE status = 'active' ORDER BY tenant_id"))
+
+
+def _hit_context(bid: dict | None) -> dict:
+    """The one price snapshot worth keeping: what the market was doing at the moment the offer was hit.
+    (Price moves that hit nothing are never stored: one latest quote per futures month, flat bids computed on read.)"""
+    if not bid:
+        return {}
+    return dict(bid_id=bid["bid_id"], basis_cents=bid["basis_cents"], flat_price=bid.get("flat_price"),
+                flat_source=bid.get("flat_source"), futures_quote=bid.get("quote_price"),
+                quote_as_of=bid.get("quote_as_of"), posted_cash_price=bid["cash_price"])
 
 
 def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, rule: dict | None = None,
               bid: dict | None = None) -> None:
     """The one place an offer becomes hit: staff clicking Mark hit, or an auto-hit rule (rule given,
-    actor None). Writes the status, the history event, the confirmation, and the billing usage."""
+    actor None). Writes the status, the history event, the confirmation, and the billing usage. Either way the
+    live price context at the moment of the hit is saved with the event and the confirmation."""
     auto = rule is not None
+    cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
+    if bid is None:                                      # a manual hit: look up the bid that prices this offer
+        bid = _reference_bid(cur, list_bids(db, tenant_id))
+    ctx = _hit_context(bid)
     db.execute("UPDATE offers SET status = 'hit', hit_at = CURRENT_TIMESTAMP(), hit_by = %s, auto_hit = %s, "
                "auto_hit_rule_id = %s, updated_at = CURRENT_TIMESTAMP() "
                "WHERE offer_id = %s AND tenant_id = %s AND status = 'submitted'",
                (actor_id, auto, rule["rule_id"] if auto else None, offer_id, tenant_id))
-    detail = {"on_behalf": False}
+    detail = {"on_behalf": False, "hit_context": ctx}
     if auto:
         detail.update(auto_hit=True, rule_id=rule["rule_id"], bid_id=bid["bid_id"],
-                      bid_basis_cents=bid["basis_cents"], bid_cash_price=bid["cash_price"])
+                      bid_basis_cents=bid["basis_cents"], bid_cash_price=bid["cash_price"],
+                      bid_flat_price=bid.get("flat_price"), flat_source=bid.get("flat_source"),
+                      futures_quote=bid.get("quote_price"))        # the live flat bid the offer was compared with
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=actor_id,
                                      event_type="hit", detail=detail), ("detail",))
     cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
-    _insert(db, "confirmations", dict(tenant_id=tenant_id, offer_id=offer_id, terms=cur, hit_by=actor_id,
-                                      auto_hit=auto), ("terms",))
+    _insert(db, "confirmations", dict(tenant_id=tenant_id, offer_id=offer_id, terms={**cur, "hit_context": ctx},
+                                      hit_by=actor_id, auto_hit=auto), ("terms",))
     _usage(db, tenant_id, "offer_hit", offer_id)
+    _notify(db, tenant_id, "offer_hit", offer_id, auto=auto)
 
 
 # ── Auto-hit rules ─────────────────────────────────────────────────────────────
@@ -558,10 +739,10 @@ def run_auto_hit(db: Db, tenant_id: str) -> int:
     """Check every outstanding offer against the live bids and the tenant's active auto-hit rules.
     Safe to call any time (idempotent). Runs when a bid is posted, an offer is entered, a rule is
     added or switched on, and from the admin's 'check now' button. Returns how many offers it hit."""
+    expire_stale(db, tenant_id)                                  # a lapsed offer is expired, never hit
     rules = _auto_rules(db, tenant_id)
     if not rules:
         return 0
-    expire_stale(db, tenant_id)                                  # a lapsed offer is expired, never hit
     bids = list_bids(db, tenant_id)
     return sum(_auto_hit_one(db, tenant_id, o, bids, rules)
                for o in db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'submitted'", (tenant_id,)))
@@ -652,6 +833,7 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=user["user_id"],
                                      event_type=new_status, detail={"on_behalf": on_behalf}),
             ("detail",))
+    _notify(db, tenant_id, "offer_" + new_status, offer_id, on_behalf=on_behalf)
     return new_status
 
 
@@ -680,8 +862,23 @@ def _require_admin(db: Db, tenant_id: str, actor_id: int) -> None:
         raise PortalError("Elevator admin only.")
 
 
+def acknowledge_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int) -> None:
+    """A staff member takes a hit offer on (who and when are recorded). Next step: its contract number."""
+    _require_staff(db, tenant_id, staff_id)
+    r = db.query("SELECT status FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
+    if not r:
+        raise PortalError("Offer not found for this tenant.")
+    if r[0]["status"] != "hit":
+        raise PortalError("Only a hit offer can be acknowledged.")
+    db.execute("UPDATE offers SET status = 'acknowledged', acknowledged_at = CURRENT_TIMESTAMP(), acknowledged_by = %s, "
+               "updated_at = CURRENT_TIMESTAMP() WHERE offer_id = %s AND tenant_id = %s", (staff_id, offer_id, tenant_id))
+    _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=staff_id,
+                                     event_type="acknowledged", detail={}), ("detail",))
+    _notify(db, tenant_id, "offer_acknowledged", offer_id)
+
+
 def complete_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int, contract_ref: str) -> None:
-    """Confirm a hit offer is done. A contract number is mandatory; the offer then lives in the archive."""
+    """Complete an ACKNOWLEDGED offer. A contract number is mandatory; the offer then lives in the archive."""
     _require_staff(db, tenant_id, staff_id)
     _, ref = _clean_details(None, contract_ref)
     if not ref:
@@ -689,14 +886,74 @@ def complete_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int, contrac
     r = db.query("SELECT status FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
     if not r:
         raise PortalError("Offer not found for this tenant.")
-    if r[0]["status"] != "hit":
-        raise PortalError("Only a hit offer can be completed.")
+    if r[0]["status"] == "hit":
+        raise PortalError("Acknowledge this offer first, then enter its contract number to complete it.")
+    if r[0]["status"] != "acknowledged":
+        raise PortalError("Only an acknowledged offer can be completed.")
     db.execute("UPDATE offers SET status = 'completed', contract_ref = %s, completed_at = CURRENT_TIMESTAMP(), "
                "completed_by = %s, updated_at = CURRENT_TIMESTAMP() WHERE offer_id = %s AND tenant_id = %s",
                (ref, staff_id, offer_id, tenant_id))
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=staff_id,
                                      event_type="completed", detail=dict(contract_ref=ref)), ("detail",))
     _usage(db, tenant_id, "offer_completed", offer_id)
+    _notify(db, tenant_id, "offer_completed", offer_id)
+
+
+def cancel_offer(db: Db, tenant_id: str, actor_id: int, offer_id: int, reason: str) -> None:
+    """Amend an offer to CANCELLED after it was hit. Staff can cancel a hit or acknowledged offer; a completed one
+    needs an admin. A reason is required. Admins are notified and the offer sits on the Hedge page's
+    'adjust hedges' list until an admin confirms the hedge was adjusted."""
+    _require_staff(db, tenant_id, actor_id)
+    reason = (reason or "").strip()
+    if not reason:
+        raise PortalError("Enter a reason for cancelling.")
+    if len(reason) > 200:
+        raise PortalError("The reason is limited to 200 characters.")
+    r = db.query("SELECT status, hedged_at FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
+    if not r:
+        raise PortalError("Offer not found for this tenant.")
+    status = r[0]["status"]
+    if status not in ("hit", "acknowledged", "completed"):
+        raise PortalError("Only an offer that was hit can be cancelled (use decline / withdraw before that).")
+    if status == "completed":
+        _require_admin(db, tenant_id, actor_id)
+    db.execute("UPDATE offers SET status = 'cancelled', cancelled_at = CURRENT_TIMESTAMP(), cancelled_by = %s, "
+               "cancel_reason = %s, hedge_adjust_needed = TRUE, updated_at = CURRENT_TIMESTAMP() "
+               "WHERE offer_id = %s AND tenant_id = %s", (actor_id, reason, offer_id, tenant_id))
+    _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=actor_id,
+                                     event_type="cancelled", detail=dict(reason=reason, from_status=status,
+                                                                        was_hedged=r[0]["hedged_at"] is not None)), ("detail",))
+    _notify(db, tenant_id, "offer_cancelled", offer_id)
+
+
+def hedge_adjustments(db: Db, tenant_id: str, admin_id: int) -> list[dict]:
+    """Cancelled-after-hit offers whose hedge an admin has not yet confirmed as adjusted, newest first."""
+    _require_admin(db, tenant_id, admin_id)
+    viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
+    rows = [o for o in list_offers(db, tenant_id, viewer) if o["status"] == "cancelled"
+            and o["hedge_adjust_needed"] and o["hedge_adjusted_at"] is None]
+    for o in rows:
+        o["contracts"] = round(o["bushels"] / CONTRACT_BUSHELS.get(o["grain"], 5000), 2)
+        o["was_hedged"] = o["hedged_at"] is not None
+    rows.sort(key=lambda o: str(o["cancelled_at"]), reverse=True)
+    return rows
+
+
+def mark_hedge_adjusted(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> int:
+    """Admin confirms the hedge for these cancelled offers has been adjusted (or that none was placed)."""
+    _require_admin(db, tenant_id, admin_id)
+    n = 0
+    for oid in offer_ids:
+        r = db.query("SELECT status, hedge_adjust_needed, hedge_adjusted_at FROM offers WHERE offer_id = %s "
+                     "AND tenant_id = %s", (oid, tenant_id))
+        if not r or r[0]["status"] != "cancelled" or not r[0]["hedge_adjust_needed"] or r[0]["hedge_adjusted_at"] is not None:
+            continue
+        db.execute("UPDATE offers SET hedge_adjusted_at = CURRENT_TIMESTAMP(), hedge_adjusted_by = %s "
+                   "WHERE offer_id = %s AND tenant_id = %s", (admin_id, oid, tenant_id))
+        _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=oid, actor_user_id=admin_id,
+                                         event_type="hedge_adjusted", detail={}), ("detail",))
+        n += 1
+    return n
 
 
 def mark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> int:
@@ -705,7 +962,7 @@ def mark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> 
     n = 0
     for oid in offer_ids:
         r = db.query("SELECT status, hedged_at FROM offers WHERE offer_id = %s AND tenant_id = %s", (oid, tenant_id))
-        if not r or r[0]["status"] != "hit" or r[0]["hedged_at"] is not None:
+        if not r or r[0]["status"] not in HELD or r[0]["hedged_at"] is not None:
             continue
         db.execute("UPDATE offers SET hedged_at = CURRENT_TIMESTAMP(), hedged_by = %s WHERE offer_id = %s "
                    "AND tenant_id = %s", (admin_id, oid, tenant_id))
@@ -720,7 +977,7 @@ def _contains(hay, needle) -> bool:
 
 
 def offer_summary(db: Db, tenant_id: str, staff_id: int, *, grains=None, periods=None, entity="",
-                  individual="", statuses=("submitted", "hit")) -> dict:
+                  individual="", statuses=("submitted", "hit", "acknowledged")) -> dict:
     """Offers grouped by commodity and delivery period, after filtering. Staff only.
     Returns {"groups": [...], "offers": [...]} — groups carry counts, bushels and weighted averages."""
     _require_staff(db, tenant_id, staff_id)
@@ -756,7 +1013,8 @@ def offer_summary(db: Db, tenant_id: str, staff_id: int, *, grains=None, periods
 def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     """What the elevator has to (or may have to) hedge. Admin only.
 
-    hit, not yet hedged  -> "now": the elevator owns the grain.
+    hit or acknowledged, not yet hedged -> "now": the elevator owns the grain.
+    adjustments          -> cancelled-after-hit offers whose hedge an admin still has to adjust.
     outstanding offers   -> "potential": what a hit would add.
     Rows are grouped by commodity, futures month and price level: the implied futures price for
     flat-price offers, the futures price for futures-only offers, the basis for basis (HTA) offers
@@ -765,7 +1023,7 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     _require_admin(db, tenant_id, admin_id)
     viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
     offers = list_offers(db, tenant_id, viewer)
-    now = [o for o in offers if o["status"] == "hit" and o["hedged_at"] is None]
+    now = [o for o in offers if o["status"] in HELD and o["hedged_at"] is None]
     potential = [o for o in offers if o["status"] == "submitted"]
 
     def build(rows):
@@ -803,4 +1061,29 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     now_lines, now_totals = build(now)
     pot_lines, pot_totals = build(potential)
     return dict(now=now_lines, now_totals=now_totals, now_offers=now,
-                potential=pot_lines, potential_totals=pot_totals)
+                potential=pot_lines, potential_totals=pot_totals,
+                adjustments=hedge_adjustments(db, tenant_id, admin_id))
+
+
+# ── Housekeeping: no price archive ───────────────────────────────────────────────
+def prune_price_history(db: Db, tenant_id: str, bid_days: int = 7, suggestion_days: int = 14) -> dict:
+    """Delete price rows nobody needs. A price that moved without anything happening is not archived:
+      * retired (replaced) bids older than `bid_days` that no offer or confirmation points at
+      * reviewed / superseded scraper suggestions older than `suggestion_days`
+    Hit offers keep their price in the offer, its history event and its confirmation, so nothing of value is lost.
+    Needs DELETE on bids and bid_suggestions (sql/06); the caller treats a permission error as non-fatal."""
+    from datetime import timedelta, timezone
+    now = datetime.now(timezone.utc)
+    cut_bid = (now - timedelta(days=bid_days)).strftime("%Y-%m-%d %H:%M:%S")
+    cut_sug = (now - timedelta(days=suggestion_days)).strftime("%Y-%m-%d %H:%M:%S")
+    nb = db.query("SELECT COUNT(*) AS n FROM bids WHERE tenant_id = %s AND NOT active AND published_at < %s "
+                  "AND bid_id NOT IN (SELECT bid_id FROM offers WHERE tenant_id = %s AND bid_id IS NOT NULL)",
+                  (tenant_id, cut_bid, tenant_id))[0]["n"]
+    db.execute("DELETE FROM bids WHERE tenant_id = %s AND NOT active AND published_at < %s "
+               "AND bid_id NOT IN (SELECT bid_id FROM offers WHERE tenant_id = %s AND bid_id IS NOT NULL)",
+               (tenant_id, cut_bid, tenant_id))
+    ns = db.query("SELECT COUNT(*) AS n FROM bid_suggestions WHERE tenant_id = %s AND status <> 'suggested' "
+                  "AND scraped_at < %s", (tenant_id, cut_sug))[0]["n"]
+    db.execute("DELETE FROM bid_suggestions WHERE tenant_id = %s AND status <> 'suggested' AND scraped_at < %s",
+               (tenant_id, cut_sug))
+    return dict(retired_bids_deleted=int(nb), suggestions_deleted=int(ns))

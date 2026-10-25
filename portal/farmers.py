@@ -90,7 +90,7 @@ def set_farmer_active(db: Db, tenant_id: str, staff_id: int, farmer_id: int, act
 def list_farmers(db: Db, tenant_id: str, staff_id: int, include_inactive: bool = False) -> list[dict]:
     """Each farmer with whether they have a portal login and how many offers are still open."""
     _require_staff(db, tenant_id, staff_id)
-    sql = ("SELECT f.farmer_id, f.name, f.individual_name, f.entity_name, f.client_id, f.phone, f.email, "
+    sql = ("SELECT f.farmer_id, f.name, f.individual_name, f.entity_name, f.client_id, f.phone, f.email, f.notify_email, "
            "f.user_id, f.active, "
            "(SELECT COUNT(*) FROM offers o WHERE o.farmer_id = f.farmer_id AND o.tenant_id = f.tenant_id "
            "AND o.status = 'submitted') AS open_offers "

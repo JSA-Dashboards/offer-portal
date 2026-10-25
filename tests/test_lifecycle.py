@@ -106,6 +106,9 @@ def test_complete_requires_a_contract_number_and_a_hit_offer(db):
     with pytest.raises(PortalError):                                             # not hit yet
         data.complete_offer(db, "rcm", 2, oid, "C-1")
     data.act_on_offer(db, "rcm", user(db, 2), oid, "hit")
+    with pytest.raises(PortalError):                                             # hit but not acknowledged yet
+        data.complete_offer(db, "rcm", 2, oid, "C-1")
+    data.acknowledge_offer(db, "rcm", 2, oid)
     for blank in ("", "   ", None):
         with pytest.raises(PortalError):
             data.complete_offer(db, "rcm", 2, oid, blank)
@@ -121,7 +124,7 @@ def test_complete_requires_a_contract_number_and_a_hit_offer(db):
         data.update_offer_details(db, "rcm", 2, oid, note="x", contract_ref="")
     data.update_offer_details(db, "rcm", 2, oid, note="corrected", contract_ref="C-5532")
     assert _offers(db)[oid]["contract_ref"] == "C-5532"
-    assert {"hit", "completed"} <= {r["event_type"] for r in db.query(
+    assert {"hit", "acknowledged", "completed"} <= {r["event_type"] for r in db.query(
         "SELECT event_type FROM offer_events WHERE offer_id = %s", (oid,))}
 
 
@@ -132,6 +135,9 @@ def test_a_contract_number_entered_earlier_is_kept_and_a_hit_offer_cannot_be_dec
         data.act_on_offer(db, "rcm", user(db, 2), oid, "decline")
     with pytest.raises(PortalError):
         data.act_on_offer(db, "rcm", user(db, 1), oid, "withdraw")
+    data.acknowledge_offer(db, "rcm", 2, oid)
+    with pytest.raises(PortalError):
+        data.act_on_offer(db, "rcm", user(db, 2), oid, "decline")                # still not declinable once acknowledged
     data.complete_offer(db, "rcm", 2, oid, "PRE-1")
     assert _offers(db)[oid]["status"] == "completed"
 

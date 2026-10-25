@@ -36,6 +36,11 @@ def run(db, only_tenant: str | None = None, fetch=scrapers.fetch_source) -> dict
         db.execute("UPDATE scrape_sources SET last_run_at = CURRENT_TIMESTAMP(), last_status = %s "
                    "WHERE source_id = %s", (status, src["source_id"]))
         results[(src["tenant_id"], src["kind"])] = res if res is not None else status
+    for tid in sorted({k[0] for k in results}):          # keep no price archive: drop replaced bids / old suggestions
+        try:
+            data.prune_price_history(db, tid)
+        except Exception as exc:                          # e.g. DELETE not granted yet: never fail the scrape for it
+            log.warning("prune skipped for %s: %s", tid, exc)
     return results
 
 
