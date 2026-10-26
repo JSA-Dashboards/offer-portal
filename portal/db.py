@@ -31,9 +31,10 @@ def _private_key_der():
 class Db:
     """Thin wrapper: `%s` placeholders everywhere, lowercase result keys."""
 
-    def __init__(self, conn, dialect: str):
+    def __init__(self, conn, dialect: str, reconnect=None):
         self.conn = conn
         self.dialect = dialect                      # 'snowflake' | 'sqlite'
+        self._reconnect = reconnect                 # opens a fresh connection (Snowflake sessions expire when idle)
         self.json_fn = "PARSE_JSON(%s)" if dialect == "snowflake" else "%s"
 
     def _sql(self, sql: str) -> str:
@@ -41,21 +42,43 @@ class Db:
             return sql.replace("%s", "?").replace("CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP")
         return sql
 
+    @staticmethod
+    def _session_expired(exc: Exception) -> bool:
+        """Snowflake drops an idle session (the app keeps one connection for hours); the next statement fails before it
+        runs, so it is safe to reconnect and send it again."""
+        msg = str(exc).lower()
+        return (type(exc).__name__ == "ReauthenticationRequest" or getattr(exc, "errno", None) in (390114, 390111, 390112)
+                or "session no longer exists" in msg or "authentication token has expired" in msg)
+
+    def _with_cursor(self, work):
+        for attempt in (1, 2):
+            cur = self.conn.cursor()
+            try:
+                return work(cur)
+            except Exception as exc:
+                if attempt == 1 and self._reconnect and self._session_expired(exc):
+                    try:
+                        self.conn.close()
+                    except Exception:
+                        pass
+                    self.conn = self._reconnect()
+                    continue
+                raise
+            finally:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
     def query(self, sql: str, params: tuple = ()) -> list[dict]:
-        cur = self.conn.cursor()
-        try:
+        def work(cur):
             cur.execute(self._sql(sql), params)
             cols = [d[0].lower() for d in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
-        finally:
-            cur.close()
+        return self._with_cursor(work)
 
     def execute(self, sql: str, params: tuple = ()) -> None:
-        cur = self.conn.cursor()
-        try:
-            cur.execute(self._sql(sql), params)
-        finally:
-            cur.close()
+        self._with_cursor(lambda cur: cur.execute(self._sql(sql), params))
         if self.dialect == "sqlite":
             self.conn.commit()
 
@@ -79,4 +102,7 @@ def connect() -> Db:
     if pkey is None:
         raise RuntimeError("Set SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PRIVATE_KEY (key-pair auth).")
     kw["private_key"] = pkey
-    return Db(sc.connect(**{k: v for k, v in kw.items() if v is not None}), "snowflake")
+    def _open():
+        return sc.connect(**{k: v for k, v in kw.items() if v is not None})
+
+    return Db(_open(), "snowflake", reconnect=_open)
