@@ -200,7 +200,7 @@ def test_outstanding_offers_show_when_they_expire_and_the_bid_board_shows_the_wi
     bid = data.list_bids(app_db, "rcm")[0]
     data.create_offer(app_db, "rcm", user(app_db, 1), **HTA, bid_id=bid["bid_id"])
     at = _as(app_db, 2)
-    assert any("Expires after Dec 20, 2999" in c.value for c in at.caption)
+    assert any("Good through Dec 20, 2999" in c.value for c in at.caption)
     goto(at, "Bid board")
     assert not at.exception, at.exception
     assert list(at.dataframe[0].value["Delivery window"]) == ["Dec 01 – Dec 20, 2999"]

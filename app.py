@@ -443,7 +443,9 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
                               key=f"{kp}dfrom_{k}")
         end = c8.date_input("Delivery to (last day: the offer expires after it)", value=bid["window_end"] if bid else None,
                             key=f"{kp}dto_{k}")
-        good = c9.date_input("Offer good until (optional)", value=None, min_value=date.today())
+        good = c9.date_input("Offer good until", value=None, min_value=date.today(),
+                             help="Leave blank and the offer stays good through the last day of the delivery period "
+                                  "(it expires the next day). Pick an earlier date to end it sooner.")
         contract_ref = st.text_input("Contract reference # (optional)", max_chars=60)
         note = st.text_area("Notes" if farmer_id else "Notes to the elevator", max_chars=500)
         if st.form_submit_button("Enter offer" if farmer_id else "Send offer", type="primary"):
@@ -501,7 +503,7 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
         if staff and o.get("bid_reached"):
             st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
         meta = [x for x in ((f"Delivery {o['delivery_start']}" + (f" → {o['delivery_end']}" if o["delivery_end"] else "")) if o["delivery_start"] else "",
-                            (f"Expires after {data.offer_delivery_end(o):%b %d, %Y}"
+                            (f"Good through {data.offer_delivery_end(o):%b %d, %Y}"
                              if o["status"] == "submitted" and data.offer_delivery_end(o) else ""),
                             f"Good until {str(o['expires_at'])[:10]}" if o["expires_at"] else "",
                             (f"Hit automatically {str(o['hit_at'])[:10]}" if o.get("auto_hit") else
