@@ -192,15 +192,15 @@ def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
 def test_each_role_sees_its_own_set_of_pages(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     farmer, staff, admin = (set(_views(_as(app_db, u))) for u in (1, 20, 2))
-    assert farmer == {"Bid board", "Make an offer", "My offers", "USDA calendar"}
-    assert {"Offers", "Purchases", "Place offer", "Bid board", "USDA calendar"} <= staff
+    assert farmer == {"Bid board", "Make an offer", "My offers", "USDA Calendar"}
+    assert {"Offers", "Purchases", "Place offer", "Bid board", "USDA Calendar"} <= staff
     assert not staff & {"Hedge", "Auto-hit", "Review scraped bids"}            # admin only
     assert staff < admin and {"Hedge", "Auto-hit", "Review scraped bids"} <= admin
 
 
 def test_the_calendar_page_renders_and_staff_cannot_edit_bids(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
-    at = _go(_as(app_db, 1), "USDA calendar")
+    at = _go(_as(app_db, 1), "USDA Calendar")
     assert not at.exception and at.dataframe
     at = _go(_as(app_db, 20), "Bid board")
     assert not at.exception and not [e for e in at.expander if e.label in ("Post a bid", "Retire a bid")]

@@ -1,5 +1,9 @@
 streamlit>=1.56      # st.tabs(on_change='rerun') runs only the open tab
 pandas>=2.0
+# The Grain Futures Seasonals page (seasonals/, generated from grain-seasonal-dashboard): plotly is pinned below 6 because
+# newer plotly/kaleido pairs silently break PNG export on Streamlit Cloud (the source app's note).
+plotly>=5.18,<6
+kaleido==0.2.1
 snowflake-connector-python>=3.7
 cryptography
 python-dotenv

@@ -587,18 +587,69 @@ STAGES = {"Outstanding": ("submitted",), "Hit": ("hit",), "Acknowledged": ("ackn
           "Completed": ("completed",), "Closed": ("declined", "withdrawn", "expired", "cancelled")}
 
 
+_CAL_COLORS = {"wasde": ("#fdecd9", "#a45a16"), "nass": ("#e3f1e4", "#2f6b3a"), "weekly": ("#e8edf1", "#4c5a66")}
+
+
+def seasonals_view() -> None:
+    """The Grain Futures Seasonals dashboard (seasonals/, generated from the standalone app by scripts/sync_seasonals.py).
+    Imported here, not at the top, so a problem in that package can never take the rest of the portal down."""
+    try:
+        from seasonals import dashboard
+    except Exception as exc:
+        st.error(f"The seasonals dashboard could not be loaded ({type(exc).__name__}). The rest of the portal is unaffected.")
+        return
+    st.session_state["_futures_shown"] = True              # futures prices are on screen: the footer carries the delayed notice
+    dashboard.render()
+
+
 @st.fragment
 def calendar_view() -> None:
-    st.subheader("USDA report calendar")
-    st.caption("Times are Central. Weekly reports can move a day in holiday weeks; always confirm on usda.gov.")
-    days = st.segmented_control("Look ahead", [14, 30, 60], default=30, format_func=lambda d: f"{d} days",
-                                key="cal_days") or 30
-    rows = usda_calendar.upcoming(data.today_ct(), days)
-    if not rows:
-        st.info("No reports in this window.")
-        return
-    st.dataframe([{"Date": f"{r['weekday']} {r['date']:%b %d}", "Time (CT)": r["time"], "Report": r["report"],
-                   "What it covers": r["note"]} for r in rows], hide_index=True, width="stretch")
+    """A month calendar of USDA reports (portal/usda_calendar.py), with a filter and the month's list below."""
+    today = data.today_ct()
+    ym = st.session_state.setdefault("cal_ym", (today.year, today.month))
+    c1, c2, c3, c4 = st.columns([1, 1, 1, 5], vertical_alignment="center")
+    if c1.button("Previous", key="cal_prev", icon=":material/chevron_left:"):
+        st.session_state["cal_ym"] = ym = (ym[0] - 1, 12) if ym[1] == 1 else (ym[0], ym[1] - 1)
+    if c2.button("Today", key="cal_today"):
+        st.session_state["cal_ym"] = ym = (today.year, today.month)
+    if c3.button("Next", key="cal_next", icon=":material/chevron_right:", icon_position="right"):
+        st.session_state["cal_ym"] = ym = (ym[0] + 1, 1) if ym[1] == 12 else (ym[0], ym[1] + 1)
+    year, month = ym
+    c4.subheader(f"{date(year, month, 1):%B %Y}")
+    show = st.pills("Show", list(usda_calendar.KIND_LABELS), selection_mode="multi", key="cal_kinds",
+                    default=list(usda_calendar.KIND_LABELS), format_func=usda_calendar.KIND_LABELS.get) or []
+    css = "".join(f".cal-ev.{k}{{background:{bg};color:{fg};}}" for k, (bg, fg) in _CAL_COLORS.items())
+    cells = []
+    for wd in ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"):
+        cells.append(f'<div class="cal-dow">{wd}</div>')
+    for week in usda_calendar.month_grid(year, month):
+        for d in week:
+            chips = "".join(
+                f'<div class="cal-ev {e["kind"]}" title="{html.escape(e["time"] + " CT: " + e["note"])}">'
+                f'{html.escape(e["report"])}</div>' for e in d["events"] if e["kind"] in show)
+            cls = "cal-day" + ("" if d["in_month"] else " out") + (" today" if d["date"] == today else "")
+            cells.append(f'<div class="{cls}"><div class="cal-n">{d["date"].day}</div>{chips}</div>')
+    st.markdown(
+        f"<style>.cal{{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px;margin:6px 0 12px;}}"
+        f".cal-dow{{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:{theme.MUTED};padding:2px 4px;}}"
+        f".cal-day{{background:{theme.SURFACE};border:1px solid {theme.BORDER};border-radius:8px;min-height:92px;padding:4px 6px;}}"
+        f".cal-day.out{{background:transparent;opacity:.45;}}.cal-day.today{{border:2px solid {theme.JSA_BLUE};}}"
+        f".cal-n{{font-size:.78rem;color:{theme.MUTED};text-align:right;}}"
+        f".cal-ev{{font-size:.7rem;line-height:1.2;border-radius:4px;padding:2px 5px;margin-top:3px;}}"
+        f"@media (max-width:640px){{.cal-day{{min-height:56px;padding:2px;}}.cal-ev{{font-size:.58rem;padding:1px 2px;}}}}"
+        f"{css}</style><div class='cal'>{''.join(cells)}</div>", unsafe_allow_html=True)
+    st.caption("Times are Central. Hover a report for its time and what it covers. Weekly reports can move a day in "
+               "holiday weeks, and only dates USDA has published are shown for the monthly and quarterly reports: "
+               "always confirm on usda.gov.")
+    rows = [e for week in usda_calendar.month_grid(year, month) for d in week if d["in_month"] for e in d["events"]
+            if e["kind"] in show and e["kind"] != "weekly"]
+    st.markdown(f"<div class='sec-header'>Monthly and quarterly reports in {date(year, month, 1):%B}</div>",
+                unsafe_allow_html=True)
+    if rows:
+        st.dataframe([{"Date": f"{r['weekday']} {r['date']:%b %d}", "Time (CT)": r["time"], "Report": r["report"],
+                       "What it covers": r["note"]} for r in rows], hide_index=True, width="stretch")
+    else:
+        st.info("No monthly or quarterly report dates are published for this month yet.")
 
 
 def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
@@ -1337,8 +1388,9 @@ def main() -> None:
     admin = user["role"] in ("elevator_admin", "platform_admin")
     views = (["Offers", "Summary"] + (["Hedge", "Auto-hit"] if admin else []) +
              ["Purchases", "Recap", "Place offer", "Farmers", "Bid board"] + (["Review scraped bids"] if admin else []) +
-             ["USDA calendar", "People"] if staff
-             else ["Bid board", "Make an offer", "My offers", "USDA calendar"])
+             ["USDA Calendar"] + (["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []) + ["People"] if staff
+             else ["Bid board", "Make an offer", "My offers", "USDA Calendar"] +
+                  (["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []))
     if user["role"] == "platform_admin":
         views = views + ["Platform"]
     if user.get("_preview"):
@@ -1370,8 +1422,10 @@ def _render_page(db, tenant: dict, user: dict, view: str, staff: bool, admin: bo
         farmers_view(db, tenant, user)
     elif view == "Review scraped bids":
         suggestions_view(db, tid, user)
-    elif view == "USDA calendar":
+    elif view == "USDA Calendar":
         calendar_view()
+    elif view == "Grain Futures Seasonals":
+        seasonals_view()
     elif view == "Bid board":
         published_view(db, tid, user, editable=admin, tenant=tenant)
     elif view == "Make an offer":

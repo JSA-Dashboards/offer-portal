@@ -19,5 +19,5 @@ def test_crop_progress_stops_after_november_and_order_is_by_time():
 
 def test_fixed_dates_are_unique_and_future_ones_appear():
     assert any(r["report"] == "Prospective Plantings" for r in cal.upcoming(date(2027, 3, 25), 10))
-    keys = [(d, r) for d, r, _, _ in cal.FIXED]
+    keys = [(e[0], e[1]) for e in cal.FIXED]
     assert len(keys) == len(set(keys))

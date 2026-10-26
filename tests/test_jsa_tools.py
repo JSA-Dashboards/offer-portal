@@ -87,6 +87,6 @@ def test_view_as_a_farmer_shows_their_pages_and_blocks_writes(app_db):
     next(r for r in at.radio if r.label == "View as").set_value("Farmer").run()
     assert not at.exception, at.exception
     views = pages(at)
-    assert list(views) == ["Bid board", "Make an offer", "My offers", "USDA calendar"]
+    assert list(views) == ["Bid board", "Make an offer", "My offers", "USDA Calendar"]
     assert any("Previewing as farmer Login Farms" in w.value for w in at.warning)
     assert not any(t.label == "Email me notifications" for t in at.toggle)
