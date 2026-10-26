@@ -234,7 +234,7 @@ def test_staff_see_the_live_flat_bid_delayed_futures_and_the_notice(app_db):
     _app_bid(app_db)
     futures.update_quotes(app_db, {"ZCZ26": _q(4.60)})
     at = _as(app_db, 2)
-    goto(at, "Bid board")
+    goto(at, "Bid Board")
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
     assert "Delayed futures." in text and "Delayed quotes." in text                    # banner + footer
@@ -269,7 +269,7 @@ def test_review_screen_edits_the_basis_and_posts_it_with_the_scraped_delivery_ra
                           futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21,
                           delivery_start="2999-12-01", delivery_end="2999-12-15")           # the source gave a clear range
     at = _as(app_db, 2)
-    goto(at, "Review scraped bids")
+    goto(at, "Review Scraped Bids")
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
     assert "Posted now: basis -38¢" in text and "Delivery Dec 01 – Dec 15, 2999" in text
@@ -287,7 +287,7 @@ def test_review_screen_refuses_to_approve_a_suggestion_with_no_clear_delivery_ra
     data.stage_suggestion(app_db, "rcm", grain="Corn", delivery_month="2999-12", source="bushelsites", location_id=1,
                           futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21)          # e.g. a "Harvest 2026" label
     at = _as(app_db, 2)
-    goto(at, "Review scraped bids")
+    goto(at, "Review Scraped Bids")
     assert "gave no clear delivery range" in "".join(m.value for m in at.markdown)
     next(b for b in at.button if b.label == "Approve").click().run()
     assert not at.exception, at.exception

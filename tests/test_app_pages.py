@@ -25,12 +25,16 @@ def _hit_offer(db):
 
 
 def test_navigation_by_role(app_db):
-    assert _views(_as(app_db, 2))[:3] == ["Offers", "Summary", "Hedge"]                 # elevator admin
+    admin = _views(_as(app_db, 2))                                                         # elevator admin
+    assert [v for v in admin if v not in ("Hedge", "Auto-Hit")] == [
+        "Offers", "Place Offer", "Summary", "Purchases", "Recap", "Bid Board", "Grain Futures Seasonals", "USDA Calendar",
+        "Review Scraped Bids", "Farmers", "People"]                                        # the order Kolten set, in Title Case
+    assert admin[3:5] == ["Hedge", "Auto-Hit"]                                             # admin-only pages follow Summary
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     staff = _views(_as(app_db, 20))
     assert "Summary" in staff and "Hedge" not in staff                                   # staff don't get the hedge page
     farmer = _views(_as(app_db, 1))
-    assert not {"Summary", "Hedge", "Farmers", "Place offer"} & set(farmer)
+    assert not {"Summary", "Hedge", "Farmers", "Place Offer"} & set(farmer)
 
 
 def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app_db):
@@ -114,7 +118,7 @@ def test_posting_a_bid_reports_how_many_flat_offers_were_repriced(app_db):
     hit = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
     data.act_on_offer(app_db, "rcm", conftest.user(app_db, 2), hit, "hit")                 # locked, not repriced
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT, bid_id=bid)
-    at = _go(_as(app_db, 2), "Bid board")
+    at = _go(_as(app_db, 2), "Bid Board")
     next(s for s in at.selectbox if s.label.startswith("Commodity and futures month")).set_value("Corn|" + contracts.options("Corn")[0])
     next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
     next(s for s in at.selectbox if s.label == "Delivery month").set_value(data_month())
@@ -138,15 +142,15 @@ def _reached_offer(db):
 
 
 def test_auto_hit_page_is_admin_only(app_db):
-    assert "Auto-hit" in _views(_as(app_db, 2))
+    assert "Auto-Hit" in _views(_as(app_db, 2))
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
-    assert "Auto-hit" not in _views(_as(app_db, 20))
-    assert "Auto-hit" not in _views(_as(app_db, 1))
+    assert "Auto-Hit" not in _views(_as(app_db, 20))
+    assert "Auto-Hit" not in _views(_as(app_db, 1))
 
 
 def test_adding_a_rule_hits_offers_the_bid_already_reached(app_db):
     oid = _reached_offer(app_db)
-    at = _go(_as(app_db, 2), "Auto-hit")
+    at = _go(_as(app_db, 2), "Auto-Hit")
     assert any("No rules yet" in i.value for i in at.info)
     next(b for b in at.button if b.label == "Add rule").click().run()               # default = any scope, no size limit
     assert not at.exception, at.exception
@@ -163,7 +167,7 @@ def test_adding_a_rule_hits_offers_the_bid_already_reached(app_db):
 def test_rule_toggle_and_check_now(app_db):
     data.add_auto_hit_rule(app_db, "rcm", 2, max_bushels=1000)                        # too small to cover a 5,000 bu offer
     oid = _reached_offer(app_db)
-    at = _go(_as(app_db, 2), "Auto-hit")
+    at = _go(_as(app_db, 2), "Auto-Hit")
     assert any("up to 1,000 bu per offer" in m.value for m in at.markdown)
     next(b for b in at.button if b.label == "Check outstanding offers now").click().run()
     assert any("Checked. 0 offers hit." in s.value for s in at.success)
@@ -177,7 +181,7 @@ def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
     oid = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT,
                             bid_id=data.list_bids(app_db, "rcm")[0]["bid_id"])           # 4.30 > bid 4.18: outstanding
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
-    at = _go(_as(app_db, 2), "Bid board")
+    at = _go(_as(app_db, 2), "Bid Board")
     next(s for s in at.selectbox if s.label.startswith("Commodity and futures month")).set_value("Corn|" + contracts.options("Corn")[0])
     next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
     next(n for n in at.number_input if n.label.startswith("Cash")).set_value(4.35)
@@ -192,17 +196,17 @@ def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
 def test_each_role_sees_its_own_set_of_pages(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     farmer, staff, admin = (set(_views(_as(app_db, u))) for u in (1, 20, 2))
-    assert farmer == {"Bid board", "Make an offer", "My offers", "USDA Calendar"}
-    assert {"Offers", "Purchases", "Place offer", "Bid board", "USDA Calendar"} <= staff
-    assert not staff & {"Hedge", "Auto-hit", "Review scraped bids"}            # admin only
-    assert staff < admin and {"Hedge", "Auto-hit", "Review scraped bids"} <= admin
+    assert farmer == {"Bid Board", "Make an Offer", "My Offers", "USDA Calendar"}
+    assert {"Offers", "Purchases", "Place Offer", "Bid Board", "USDA Calendar"} <= staff
+    assert not staff & {"Hedge", "Auto-Hit", "Review Scraped Bids"}            # admin only
+    assert staff < admin and {"Hedge", "Auto-Hit", "Review Scraped Bids"} <= admin
 
 
 def test_the_calendar_page_renders_and_staff_cannot_edit_bids(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     at = _go(_as(app_db, 1), "USDA Calendar")
     assert not at.exception and at.dataframe
-    at = _go(_as(app_db, 20), "Bid board")
+    at = _go(_as(app_db, 20), "Bid Board")
     assert not at.exception and not [e for e in at.expander if e.label in ("Post a bid", "Retire a bid")]
-    at = _go(_as(app_db, 2), "Bid board")
+    at = _go(_as(app_db, 2), "Bid Board")
     assert [e for e in at.expander if e.label == "Post a bid"]

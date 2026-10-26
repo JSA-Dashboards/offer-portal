@@ -12,14 +12,14 @@ def _go(at, view):
 
 def test_staff_view_lists_the_new_screens(app_db):
     at = _as(app_db, 2)
-    assert {"Place offer", "Farmers"} <= set(pages(at))
-    assert not {"Place offer", "Farmers"} & set(pages(_as(app_db, 1)))       # farmers don't get them
+    assert {"Place Offer", "Farmers"} <= set(pages(at))
+    assert not {"Place Offer", "Farmers"} & set(pages(_as(app_db, 1)))       # farmers don't get them
 
 
 def test_staff_adds_farmer_then_places_offer_for_them(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-30, cash_price=4.2)
-    at = _go(_as(app_db, 2), "Place offer")
+    at = _go(_as(app_db, 2), "Place Offer")
     f = {t.label: t for t in at.text_input}
     f["Client ID (your account number)"].set_value("10442")
     f["Entity name"].set_value("Farmer Bros LLC")
@@ -70,7 +70,7 @@ def test_farmer_sees_contract_ref_and_notes_but_cannot_edit_them(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (30, 'rcm', 'pat@x.com', 'farmer')")
     app_db.execute("UPDATE farmers SET user_id = 30 WHERE farmer_id = %s", (fid,))
     at = _as(app_db, 30)
-    goto(at, "My offers")
+    goto(at, "My Offers")
     assert not at.exception, at.exception
     assert any("Contract # C-77" in c.value and "hello" in c.value for c in at.caption)
     assert not [e for e in at.expander if e.label != "Password"]                                                  # no edit controls for farmers

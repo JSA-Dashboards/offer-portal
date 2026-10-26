@@ -44,7 +44,7 @@ def test_admin_scrape_now_button_runs_the_tenant_scrape(app_db, monkeypatch):
                   basis_cents=-20, cash_price=4.60, delivery_start="2999-12-01", delivery_end="2999-12-31")]
     monkeypatch.setattr(scrapers, "fetch_source", lambda src: items)
     monkeypatch.setattr(scrape_run, "run", lambda db, only=None, fetch=lambda s: items, _r=scrape_run.run: _r(db, only, fetch))
-    at = goto(_as(app_db, 2), "Review scraped bids")
+    at = goto(_as(app_db, 2), "Review Scraped Bids")
     assert any("Not scraped yet" in c.value for c in at.caption)
     next(b for b in at.button if b.label == "Scrape bids now").click().run()
     assert not at.exception, at.exception
@@ -57,4 +57,4 @@ def test_only_the_open_tab_runs(app_db):
     at = _as(app_db, 2)                                       # opens on Offers: other pages must not have run
     assert not at.exception
     assert not at.dataframe and not [e for e in at.expander if e.label == "Post a bid"]
-    assert [e for e in goto(at, "Bid board").expander if e.label == "Post a bid"]
+    assert [e for e in goto(at, "Bid Board").expander if e.label == "Post a bid"]

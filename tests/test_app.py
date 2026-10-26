@@ -87,14 +87,14 @@ def test_staff_lands_on_offers_inbox_and_can_mark_hit(app_db):
 def test_staff_bid_board_has_post_controls(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
     at = _as(app_db, 2)
-    goto(at, "Bid board")
+    goto(at, "Bid Board")
     assert not at.exception
     assert at.dataframe and at.expander
 
 
 def test_farmer_makes_offer(app_db):
     at = _as(app_db, 1)
-    goto(at, "Make an offer")
+    goto(at, "Make an Offer")
     assert not at.exception, at.exception
     send = lambda: next(b for b in at.button if b.label == "Send offer")
     send().click().run()                                   # open price: no delivery period, no futures month yet
@@ -104,7 +104,7 @@ def test_farmer_makes_offer(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-30, cash_price=4.2)
     at = _as(app_db, 1)
-    goto(at, "Make an offer")
+    goto(at, "Make an Offer")
     at.session_state["offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]                       # pick the bid (AppTest cannot drive a
     at.run()                                                                                         # selectbox that has a format_func)
     assert not at.exception, at.exception

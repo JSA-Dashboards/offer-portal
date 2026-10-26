@@ -948,13 +948,13 @@ def _tenant_editor(db, user: dict, t: dict) -> None:
 @st.fragment
 def platform_view(db, user: dict) -> None:
     uid = user["user_id"]
-    for section in _tab_pages(["Tenants", "Usage report", "JSA admins"], key="platform_tabs"):
+    for section in _tab_pages(["Tenants", "Usage Report", "JSA Admins"], key="platform_tabs"):
         _platform_section(db, user, section)
 
 
 def _platform_section(db, user: dict, section: str) -> None:
     uid = user["user_id"]
-    if section == "JSA admins":
+    if section == "JSA Admins":
         st.caption("JSA super admins can open every tenant and preview each role. They sign in with an emailed code.")
         for a in platform.list_platform_admins(db, uid):
             c1, c2 = st.columns([4, 1])
@@ -973,7 +973,7 @@ def _platform_section(db, user: dict, section: str) -> None:
                 else:
                     st.success(f"{em.strip().lower()} can now sign in.")
         return
-    if section == "Usage report":
+    if section == "Usage Report":
         month = st.text_input("Month (YYYY-MM)", data.today_ct().strftime("%Y-%m"))
         try:
             rows = platform.usage_table(db, uid, month)
@@ -1492,11 +1492,11 @@ def main() -> None:
     staff = user["role"] in data.ELEVATOR_ROLES or user["role"] == "platform_admin"
     tid = tenant["tenant_id"]
     admin = user["role"] in ("elevator_admin", "platform_admin")
-    views = (["Offers", "Summary"] + (["Hedge", "Auto-hit"] if admin else []) +
-             ["Purchases", "Recap", "Place offer", "Farmers", "Bid board"] + (["Review scraped bids"] if admin else []) +
-             ["USDA Calendar"] + (["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []) + ["People"] if staff
-             else ["Bid board", "Make an offer", "My offers", "USDA Calendar"] +
-                  (["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []))
+    seasonals = ["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []
+    views = (["Offers", "Place Offer", "Summary"] + (["Hedge", "Auto-Hit"] if admin else []) +
+             ["Purchases", "Recap", "Bid Board"] + seasonals + ["USDA Calendar"] +
+             (["Review Scraped Bids"] if admin else []) + ["Farmers", "People"] if staff
+             else ["Bid Board", "Make an Offer", "My Offers"] + seasonals + ["USDA Calendar"])
     if user["role"] == "platform_admin":
         views = views + ["Platform"]
     if user.get("_preview"):
@@ -1514,7 +1514,7 @@ def _render_page(db, tenant: dict, user: dict, view: str, staff: bool, admin: bo
         summary_view(db, tid, user)
     elif view == "Hedge":
         hedge_view(db, tid, user)
-    elif view == "Auto-hit":
+    elif view == "Auto-Hit":
         auto_hit_view(db, tid, user)
     elif view == "Purchases":
         purchases_view(db, tenant, user)
@@ -1522,19 +1522,19 @@ def _render_page(db, tenant: dict, user: dict, view: str, staff: bool, admin: bo
         recap_view(db, tenant, user)
     elif view == "People":
         people_view(db, tenant, user)
-    elif view == "Place offer":
+    elif view == "Place Offer":
         place_offer_view(db, tenant, user)
     elif view == "Farmers":
         farmers_view(db, tenant, user)
-    elif view == "Review scraped bids":
+    elif view == "Review Scraped Bids":
         suggestions_view(db, tid, user)
     elif view == "USDA Calendar":
         calendar_view()
     elif view == "Grain Futures Seasonals":
         seasonals_view()
-    elif view == "Bid board":
+    elif view == "Bid Board":
         published_view(db, tid, user, editable=admin, tenant=tenant)
-    elif view == "Make an offer":
+    elif view == "Make an Offer":
         offer_form_view(db, tenant, user)
     else:
         offers_view(db, tid, user, staff)

@@ -76,7 +76,7 @@ def user(db, uid):
 
 
 # ── AppTest helpers: the portal's pages are tab pages (only the open tab runs) ──────────────
-_SUBTABS = ("Tenants", "Usage report", "JSA admins")
+_SUBTABS = ("Tenants", "Usage Report", "JSA Admins")
 
 
 def pages(at):
