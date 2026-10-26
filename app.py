@@ -136,9 +136,9 @@ def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
             else:
                 st.caption("No farmer here has a login yet, so there is nothing to show as a farmer.")
     if lens == "Elevator admin":
-        return {**real, "role": "elevator_admin", "_preview": "elevator admin"}
+        return {**real, "role": "elevator_admin", "tenant_id": tenant["tenant_id"], "_preview": "elevator admin"}
     if lens == "Elevator staff":
-        return {**real, "role": "elevator_staff", "_preview": "elevator staff"}
+        return {**real, "role": "elevator_staff", "tenant_id": tenant["tenant_id"], "_preview": "elevator staff"}
     if lens == "Farmer":
         if farmer:
             return {**farmer, "_preview": f"farmer {farmer['farmer_name']} (read-only)"}

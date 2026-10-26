@@ -90,3 +90,18 @@ def test_view_as_a_farmer_shows_their_pages_and_blocks_writes(app_db):
     assert list(views) == ["Bid board", "Make an offer", "My offers", "USDA Calendar"]
     assert any("Previewing as farmer Login Farms" in w.value for w in at.warning)
     assert not any(t.label == "Email me notifications" for t in at.toggle)
+
+
+def test_jsa_admin_can_mark_an_offer_hit_in_any_tenant_and_the_previews_too(db):
+    from portal import data
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", basis_cents=-38, futures_symbol="ZCZ26")
+    bid = data.list_bids(db, "rcm")[0]["bid_id"]
+    offer = lambda: data.create_offer(db, "rcm", conftest.user(db, 1), grain="Corn", contract_type="HTA", price_type="BASIS",
+                                      bushels=5000, basis_cents=-30, futures_symbol="ZCZ26", bid_id=bid)
+    jsa = conftest.user(db, 5)                                                     # platform admin: no tenant of their own
+    assert data.act_on_offer(db, "rcm", jsa, offer(), "hit") == "hit"
+    for role in ("elevator_admin", "elevator_staff"):                              # the View as previews keep your id
+        assert data.act_on_offer(db, "rcm", {**jsa, "role": role, "tenant_id": "rcm"}, offer(), "decline") == "declined"
+    other = {**conftest.user(db, 4)}                                               # another tenant's admin still can't
+    with pytest.raises(PortalError):
+        data.act_on_offer(db, "rcm", other, offer(), "hit")

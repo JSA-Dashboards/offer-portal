@@ -819,7 +819,8 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
     on_behalf=True: elevator staff record a farmer's withdrawal (phone call, in person). The
     event log keeps the staff user as actor and flags it.
     """
-    if user["tenant_id"] != tenant_id:
+    platform = user["role"] == "platform_admin"                    # JSA works in any tenant, with an elevator admin's powers
+    if not platform and user["tenant_id"] != tenant_id:
         raise PortalError("Wrong tenant.")
     r = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
     if not r:
@@ -830,13 +831,13 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
                         (o["farmer_id"], tenant_id, user["user_id"]))
         if on_behalf or not mine:
             raise PortalError("Not your offer.")
-    if on_behalf and user["role"] not in ELEVATOR_ROLES:
+    if on_behalf and user["role"] not in ELEVATOR_ROLES and not platform:
         raise PortalError("Only elevator staff can respond for a farmer.")
     allowed = _TRANSITIONS.get(o["status"], {}).get(action)
     if not allowed:
         raise PortalError(f"Cannot {action} an offer that is {o['status']}.")
     new_status, roles = allowed
-    acting_role = "farmer" if on_behalf else user["role"]
+    acting_role = "farmer" if on_behalf else ("elevator_admin" if platform else user["role"])
     if acting_role not in roles:
         raise PortalError(f"A {acting_role} cannot {action} this offer.")
     if new_status == "hit":
