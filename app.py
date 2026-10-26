@@ -128,6 +128,44 @@ def _send_code(tenant: dict | None):
     return send
 
 
+def password_form(db, user: dict, key: str, current_needed: bool = False) -> bool:
+    """New-password fields (and the current password when one is set and nothing else proved who they are).
+    True once saved."""
+    with st.form(key, clear_on_submit=True):
+        cur = st.text_input("Current password", type="password") if current_needed else None
+        new = st.text_input(f"New password (at least {auth.MIN_PASSWORD} characters)", type="password")
+        again = st.text_input("New password again", type="password")
+        go = st.form_submit_button("Save password", type="primary")
+    if not go:
+        return False
+    try:
+        if current_needed and not auth.verify_password(db, user["email"], cur or "", user["tenant_id"]):
+            st.error("The current password isn't right.")
+            return False
+        if new != again:
+            st.error("The two passwords don't match.")
+            return False
+        auth.set_password(db, user["user_id"], new)
+    except data.PortalError as e:
+        st.error(str(e))
+        return False
+    return True
+
+
+def set_password_view(db, user: dict) -> None:
+    """Right after an email-code sign-in: offer to set a password so next time is one step."""
+    st.subheader("Set a password for next time")
+    st.caption("You just signed in with an email code. With a password you can sign in with your email and password "
+               "from now on. If you already have one and forgot it, this replaces it.")
+    if password_form(db, user, "set_pw"):
+        st.session_state.pop("pw_offer", None)
+        st.success("Password saved. Use it next time.")
+        st.rerun()
+    if st.button("Skip for now", key="skip_pw"):
+        st.session_state.pop("pw_offer", None)
+        st.rerun()
+
+
 def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
     """JSA super admin: jump to any tenant and look at the portal as an elevator admin, staff or a farmer.
     Returns the user the page should be drawn for. Admin/staff previews keep your own identity (anything you do is
@@ -183,6 +221,25 @@ def console_view(db, real: dict) -> None:
 
 
 def login_view(db, tenant: dict | None) -> None:
+    """Password sign-in for everyday use; the emailed code for the first time, a forgotten password, or no password yet."""
+    tid = tenant["tenant_id"] if tenant else None
+    if auth.passwords_ready(db) and st.session_state.get("login_step", "email") == "email":
+        how = st.segmented_control("Sign in with", ["Password", "Email code"], default="Password", key="login_how",
+                                   label_visibility="collapsed") or "Password"
+        if how == "Password":
+            st.caption("Sign in with your email and password. First time, or forgot it? Choose **Email code**.")
+            with st.form("password_form"):
+                email = st.text_input("Email")
+                pw = st.text_input("Password", type="password")
+                go = st.form_submit_button("Sign in", type="primary")
+            if go:
+                u = auth.verify_password(db, email, pw, tid)
+                if u:
+                    st.session_state.update(user=u, tenant_id=tid)
+                    st.rerun()
+                st.error("That email and password didn't match, or password sign-in is paused for a few minutes. "
+                         "You can always sign in with an email code instead.")
+            return
     st.caption("Sign in with your email — we'll send you a one-time code.")
     if not DEV and not auth.graph_configured():
         st.warning("Email isn't set up on this deployment, so sign-in codes can't be sent. "
@@ -212,7 +269,8 @@ def login_view(db, tenant: dict | None) -> None:
         if go:
             u = auth.verify_code(db, st.session_state["login_email"], code, tenant["tenant_id"] if tenant else None)
             if u:
-                st.session_state.update(user=u, tenant_id=tenant["tenant_id"] if tenant else None)
+                st.session_state.update(user=u, tenant_id=tenant["tenant_id"] if tenant else None,
+                                        pw_offer=auth.passwords_ready(db))      # just proved the email: offer a password
                 st.session_state.pop("login_step", None)
                 st.session_state.pop("_dev_code", None)
                 st.rerun()
@@ -738,15 +796,26 @@ def join_view(db, tenant: dict, token: str) -> None:
         return
     st.subheader("Accept your invitation")
     st.caption(f"You're joining as {ROLE_LABELS[inv['role']].lower()} using {inv['email']}.")
+    ready = auth.passwords_ready(db)
     with st.form("join_form"):
         name = st.text_input("Your name")
+        pw = st.text_input(f"Choose a password (at least {auth.MIN_PASSWORD} characters)", type="password") if ready else None
+        again = st.text_input("Password again", type="password") if ready else None
         if st.form_submit_button("Join", type="primary"):
             try:
+                if ready:
+                    if pw != again:
+                        raise data.PortalError("The two passwords don't match.")
+                    problem = auth.check_policy(pw or "", inv["email"])
+                    if problem:
+                        raise data.PortalError(problem)
                 u = people.accept_invite(db, token, tenant["tenant_id"], name)
+                if ready:
+                    auth.set_password(db, u["user_id"], pw)
             except data.PortalError as e:
                 st.error(str(e))
                 return
-            st.session_state.update(user=u, tenant_id=tenant["tenant_id"])
+            st.session_state.update(user=auth._public(u), tenant_id=tenant["tenant_id"])
             st.query_params.pop("invite", None)
             st.rerun()
 
@@ -1393,6 +1462,9 @@ def main() -> None:
             login_view(db, tenant)
         _stop(tenant)
 
+    if st.session_state.get("pw_offer") and not user.get("_preview"):
+        set_password_view(db, user)
+        _stop(tenant)
     if jsa:
         user = jsa_sidebar(db, real, tenant)
     with st.sidebar:
@@ -1408,8 +1480,12 @@ def main() -> None:
             if now != was:
                 notify.set_notify(db, user["user_id"], now)
                 st.session_state[pref] = now
+        if auth.passwords_ready(db) and not user.get("_preview"):
+            with st.expander("Password"):
+                if password_form(db, real or user, "change_pw", current_needed=auth.has_password(db, user["user_id"])):
+                    st.success("Password saved.")
         if st.button("Sign out"):
-            for k in ("user", "tenant_id", "login_step"):
+            for k in ("user", "tenant_id", "login_step", "pw_offer"):
                 st.session_state.pop(k, None)
             st.rerun()
 

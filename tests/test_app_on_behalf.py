@@ -73,7 +73,7 @@ def test_farmer_sees_contract_ref_and_notes_but_cannot_edit_them(app_db):
     goto(at, "My offers")
     assert not at.exception, at.exception
     assert any("Contract # C-77" in c.value and "hello" in c.value for c in at.caption)
-    assert not at.expander                                                  # no edit controls for farmers
+    assert not [e for e in at.expander if e.label != "Password"]                                                  # no edit controls for farmers
 
 
 def test_staff_accepts_and_withdraws_for_a_phone_farmer(app_db):

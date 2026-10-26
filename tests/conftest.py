@@ -27,7 +27,8 @@ CREATE TABLE tenants (tenant_id TEXT PRIMARY KEY, name TEXT, status TEXT DEFAULT
   primary_color TEXT, accent_color TEXT, support_email TEXT, from_name TEXT,
   hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, show_futures INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE locations (location_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, state TEXT, active INT DEFAULT 1);
-CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT, notify_email INT DEFAULT 1);
+CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT, notify_email INT DEFAULT 1,
+  password_hash TEXT, password_set_at TEXT, failed_logins INT DEFAULT 0, locked_until TEXT);
 CREATE TABLE bid_suggestions (suggestion_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, grain TEXT,
   delivery_month TEXT, delivery_start TEXT, delivery_end TEXT, futures_symbol TEXT, basis_cents INT, cash_price REAL, source TEXT,
   scraped_at TEXT DEFAULT CURRENT_TIMESTAMP, status TEXT DEFAULT 'suggested', reviewed_by INT, reviewed_at TEXT);

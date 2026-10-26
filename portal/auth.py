@@ -16,6 +16,13 @@ from datetime import datetime, timedelta, timezone
 
 from .db import Db
 
+PBKDF2_ROUNDS = 600_000                      # OWASP's 2023 figure for PBKDF2-HMAC-SHA256
+MIN_PASSWORD = 10
+MAX_FAILS, LOCK_FOR = 5, timedelta(minutes=15)
+_SECRET_COLS = ("password_hash", "failed_logins", "locked_until", "password_set_at")
+_COMMON = {"password", "password1", "password123", "1234567890", "qwertyuiop", "iloveyou12", "letmein123",
+           "welcome123", "changeme123", "admin12345", "0123456789", "abcdefghij"}
+
 CODE_TTL = timedelta(minutes=10)
 MAX_ATTEMPTS = 5
 MAX_REQUESTS, REQUEST_WINDOW = 5, timedelta(minutes=15)
@@ -39,13 +46,18 @@ def _as_utc(v) -> datetime:
     return v if v.tzinfo else v.replace(tzinfo=timezone.utc)
 
 
+def _public(u: dict) -> dict:
+    """The user as the app keeps it in the session: never the password hash or its lockout counters."""
+    return {k: v for k, v in u.items() if k not in _SECRET_COLS}
+
+
 def _allowed_user(db: Db, email: str, tenant_id: str | None) -> dict | None:
     r = db.query("SELECT * FROM users WHERE LOWER(email) = %s AND active", (email,))
     if not r:
         return None
     u = r[0]
     if u["role"] == "platform_admin" or u["tenant_id"] == tenant_id:
-        return u
+        return _public(u)
     return None
 
 
@@ -120,3 +132,109 @@ def graph_configured() -> bool:
     _graph_env()
     return all(os.environ.get(k) for k in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID",
                                            "GRAPH_CLIENT_SECRET", "GRAPH_SENDER"))
+
+
+# ── Passwords ───────────────────────────────────────────────────────────────
+# A password is the everyday sign-in; the emailed code stays for the first sign-in (it proves the email is theirs),
+# for a forgotten password, and for anyone who has not set one. Hashes are salted PBKDF2 (stdlib, no extra package).
+def passwords_ready(db: Db) -> bool:
+    """True once the users table has the password columns (sql/11). Until then the app runs on email codes alone,
+    so deploying the code before the SQL never breaks sign-in. A miss is re-checked after a minute."""
+    import time
+    now = time.monotonic()
+    state = getattr(db, "_pw_ready", None)
+    if state and (state[0] or now - state[1] < 60):
+        return state[0]
+    try:
+        db.query("SELECT password_hash, failed_logins, locked_until FROM users LIMIT 1")
+        ok = True
+    except Exception:
+        ok = False
+    db._pw_ready = (ok, now)
+    return ok
+
+
+def hash_password(password: str, rounds: int = PBKDF2_ROUNDS) -> str:
+    salt = _secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac("sha256", (_pepper() + password).encode(), salt, rounds)
+    return f"pbkdf2_sha256${rounds}${salt.hex()}${dk.hex()}"
+
+
+def _matches(password: str, stored: str) -> bool:
+    try:
+        algo, rounds, salt, want = stored.split("$")
+        dk = hashlib.pbkdf2_hmac("sha256", (_pepper() + password).encode(), bytes.fromhex(salt), int(rounds))
+        return algo == "pbkdf2_sha256" and hmac.compare_digest(dk.hex(), want)
+    except (ValueError, AttributeError):
+        return False
+
+
+_DUMMY = None
+
+
+def check_policy(password: str, email: str = "") -> str | None:
+    """Why this password is not acceptable, or None if it is."""
+    pw = password or ""
+    if len(pw) < MIN_PASSWORD:
+        return f"Use at least {MIN_PASSWORD} characters. A few words strung together is easy to remember and hard to guess."
+    if pw.lower() in _COMMON or len(set(pw)) < 4:
+        return "That password is too easy to guess."
+    if email and (pw.lower() == email.lower() or pw.lower() == email.split("@")[0].lower()):
+        return "Your password can't be your email address."
+    return None
+
+
+def has_password(db: Db, user_id: int) -> bool:
+    if not passwords_ready(db):
+        return False
+    r = db.query("SELECT password_hash FROM users WHERE user_id = %s", (user_id,))
+    return bool(r and r[0]["password_hash"])
+
+
+def set_password(db: Db, user_id: int, new_password: str) -> None:
+    """Sets (or replaces) a user's password. Callers prove who the person is first: a code sign-in, an accepted
+    invite, or the current password."""
+    from .data import PortalError, _audit
+    if not passwords_ready(db):
+        raise PortalError("Passwords aren't switched on yet. Please use an email code.")
+    u = db.query("SELECT user_id, tenant_id, email FROM users WHERE user_id = %s AND active", (user_id,))
+    if not u:
+        raise PortalError("Account not found.")
+    problem = check_policy(new_password, u[0]["email"])
+    if problem:
+        raise PortalError(problem)
+    db.execute("UPDATE users SET password_hash = %s, password_set_at = CURRENT_TIMESTAMP(), failed_logins = 0, "
+               "locked_until = NULL WHERE user_id = %s", (hash_password(new_password), user_id))
+    _audit(db, u[0]["tenant_id"], user_id, "password_set", {})
+
+
+def verify_password(db: Db, email: str, password: str, tenant_id: str | None) -> dict | None:
+    """The user if the email and password match and they may sign in on this page, else None. All failures look the
+    same (wrong password, unknown email, no password set, locked): a stranger learns nothing. Five wrong passwords in
+    a row pause password sign-in for that account for 15 minutes (the emailed code still works)."""
+    global _DUMMY
+    email, password = (email or "").strip().lower(), password or ""
+    rows = db.query("SELECT * FROM users WHERE LOWER(email) = %s AND active", (email,)) if passwords_ready(db) else []
+    u = rows[0] if rows else None
+    stored = (u or {}).get("password_hash")
+    if not stored:                                       # spend the same time as a real check
+        _DUMMY = _DUMMY or hash_password("not-a-real-password", PBKDF2_ROUNDS)
+        _matches(password, _DUMMY)
+        return None
+    now = datetime.now(timezone.utc)
+    if u.get("locked_until") and _as_utc(u["locked_until"]) > now:
+        _matches(password, stored)
+        return None
+    if not _matches(password, stored):
+        fails = int(u.get("failed_logins") or 0) + 1
+        if fails >= MAX_FAILS:
+            db.execute("UPDATE users SET failed_logins = 0, locked_until = %s WHERE user_id = %s",
+                       (_ts(now + LOCK_FOR), u["user_id"]))
+        else:
+            db.execute("UPDATE users SET failed_logins = %s WHERE user_id = %s", (fails, u["user_id"]))
+        return None
+    if u["role"] != "platform_admin" and u["tenant_id"] != tenant_id:
+        return None                                      # right password, wrong elevator's page
+    if u.get("failed_logins") or u.get("locked_until"):
+        db.execute("UPDATE users SET failed_logins = 0, locked_until = NULL WHERE user_id = %s", (u["user_id"],))
+    return _public(u)

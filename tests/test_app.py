@@ -120,8 +120,9 @@ def test_farmer_view_is_read_only_board(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
     at = _sign_in(run(t="rcm"), app_db, "f@a.com")
     assert not at.exception
+    next(b for b in at.button if b.label == "Skip for now").click().run()      # the offer to set a password
     assert at.dataframe
-    assert not at.expander
+    assert not [e for e in at.expander if e.label != "Password"]
 
 
 def test_join_page_accepts_invite_and_signs_in(app_db):
@@ -131,9 +132,13 @@ def test_join_page_accepts_invite_and_signs_in(app_db):
     assert not at.exception
     assert any("newbie@x.com" in c.value for c in at.caption)
     at.text_input[0].set_value("Pat Farmer")
+    at.text_input[1].set_value("a long enough phrase").run()                  # choose a password
+    at.text_input[2].set_value("a long enough phrase").run()
     next(b for b in at.button if b.label == "Join").click().run()
     assert not at.exception
     assert at.session_state["user"]["email"] == "newbie@x.com"
+    assert "password_hash" not in at.session_state["user"]                    # never kept in the session
+    assert auth.verify_password(app_db, "newbie@x.com", "a long enough phrase", "rcm")
     assert app_db.query("SELECT role FROM users WHERE email = 'newbie@x.com'")[0]["role"] == "farmer"
 
 

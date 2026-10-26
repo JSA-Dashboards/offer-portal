@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS users (
     notify_email   BOOLEAN      DEFAULT TRUE,                -- offer / recap emails (NULL counts as on)
     invited_by     NUMBER(38,0),
     created_at     TIMESTAMP_TZ DEFAULT CURRENT_TIMESTAMP(),
+    password_hash  STRING,                                      -- pbkdf2_sha256$rounds$salt$hash; NULL = no password yet (email code only)
+    password_set_at TIMESTAMP_TZ,
+    failed_logins  NUMBER(38,0) DEFAULT 0,                      -- wrong passwords in a row
+    locked_until   TIMESTAMP_TZ,                                -- password sign-in paused until then
     PRIMARY KEY (user_id),
     UNIQUE (email)                                  -- one tenant per login
 );

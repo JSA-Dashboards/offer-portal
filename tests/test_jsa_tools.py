@@ -113,6 +113,7 @@ def test_a_failed_code_email_says_what_kind_of_failure_it_was(app_db, monkeypatc
     monkeypatch.setattr(auth, "request_code", boom)
     at = AppTest.from_file("app.py", default_timeout=20)
     at.query_params["t"] = "rcm"
+    at.session_state["login_how"] = "Email code"
     at.run()
     next(t for t in at.text_input if t.label == "Email").set_value("admin@rcm.com")
     next(b for b in at.button if b.label == "Send code").click().run()
