@@ -60,3 +60,27 @@ def test_other_errors_are_not_retried_and_a_second_failure_surfaces():
     stuck = Db(FakeConn(dead=True), "snowflake", reconnect=lambda: FakeConn(dead=True))
     with pytest.raises(ReauthenticationRequest):
         stuck.query("SELECT 1")
+
+
+def test_role_checks_are_reused_briefly_but_misses_and_changes_are_not_stuck(db):
+    from portal import data
+    db.actor_ttl = 60
+    seen = []
+    real = Db.query
+    Db.query = lambda self, sql, params=(): (seen.append(sql), real(self, sql, params))[1]
+    try:
+        for _ in range(3):
+            data._require_admin(db, "rcm", 2)                    # admin of rcm
+        assert sum("FROM users" in q for q in seen) == 1         # one lookup, reused
+        db.execute("UPDATE users SET role = 'farmer' WHERE user_id = 2")
+        data._require_admin(db, "rcm", 2)                        # still the cached row inside the window...
+        db.__dict__["_actor_cache"].clear()                      # ...and the app clears it on every action
+        with pytest.raises(data.PortalError):
+            data._require_admin(db, "rcm", 2)
+        with pytest.raises(data.PortalError):                    # an unknown user is never cached as allowed
+            data._require_admin(db, "rcm", 999)
+        db.actor_ttl = 0
+        db.execute("UPDATE users SET role = 'elevator_admin' WHERE user_id = 2")
+        data._require_admin(db, "rcm", 2)
+    finally:
+        Db.query = real

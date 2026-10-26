@@ -12,6 +12,7 @@ import logging
 import os
 import pathlib
 import re
+import time
 from datetime import date
 
 import streamlit as st
@@ -38,7 +39,21 @@ st.set_page_config(page_title="JSA Offer Portal Management", page_icon=str(_ICON
 
 @st.cache_resource
 def get_db():
-    return connect()
+    db = connect()
+    db.actor_ttl = 15          # a page makes several role checks: reuse each for a few seconds (see data._actor)
+    return db
+
+
+def _kept(key: str, ttl: float, fn):
+    """fn()'s result, kept in this session for ttl seconds. Every tab click reruns the whole script and each database
+    round trip costs ~0.1-0.3 s, so things that rarely change (the tenant row, the JSA tenant list) are not re-read each time."""
+    now = time.monotonic()
+    hit = st.session_state.get(key)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    st.session_state[key] = (now, val)
+    return val
 
 
 def _markets(count: int = 6) -> list[str]:
@@ -117,7 +132,7 @@ def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
     """JSA super admin: jump to any tenant and look at the portal as an elevator admin, staff or a farmer.
     Returns the user the page should be drawn for. Admin/staff previews keep your own identity (anything you do is
     recorded as you); a farmer preview shows that farmer's own pages, read-only."""
-    tenants = platform.list_tenants(db, real["user_id"])
+    tenants = _kept("_k_tenants", 60, lambda: platform.list_tenants(db, real["user_id"]))
     slugs = [t["tenant_id"] for t in tenants]
     names = {t["tenant_id"]: t["name"] for t in tenants}
     with st.sidebar:
@@ -131,7 +146,7 @@ def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
         lens = st.radio("View as", ["JSA admin (me)", "Elevator admin", "Elevator staff", "Farmer"], key="view_as")
         farmer = None
         if lens == "Farmer":
-            fl = platform.preview_farmers(db, real["user_id"], tenant["tenant_id"])
+            fl = _kept(f"_k_pf_{tenant['tenant_id']}", 60, lambda: platform.preview_farmers(db, real["user_id"], tenant["tenant_id"]))
             if fl:
                 farmer = st.selectbox("Which farmer", fl, format_func=lambda u: u["farmer_name"], key="view_as_farmer")
             else:
@@ -227,6 +242,12 @@ def _flush_mail() -> None:
 def _refresh() -> None:
     """Rerun just the calling fragment; a full rerun when not in a fragment run (e.g. AppTest)."""
     _flush_mail()
+    for k in [k for k in st.session_state if str(k).startswith(("_k_pf_", "_k_tenant", "_k_locs_"))]:
+        st.session_state.pop(k, None)                  # people / tenants may have just changed
+    try:
+        get_db().__dict__.get("_actor_cache", {}).clear()   # so a role change just made takes effect now
+    except Exception:
+        pass
     try:
         st.rerun(scope="fragment")
     except st.errors.StreamlitAPIException:
@@ -234,7 +255,7 @@ def _refresh() -> None:
 
 
 def _loc_names(db, tenant_id: str) -> dict:
-    return {l["location_id"]: l["name"] for l in data.list_locations(db, tenant_id)}
+    return _kept(f"_k_locs_{tenant_id}", 60, lambda: {l["location_id"]: l["name"] for l in data.list_locations(db, tenant_id)})
 
 
 def _repriced_msg(n: int) -> str:
@@ -658,7 +679,7 @@ def calendar_view() -> None:
 
 
 def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
-    data.expire_stale(db, tenant_id)
+    _kept(f"_k_exp_{tenant_id}", 45, lambda: data.expire_stale(db, tenant_id))      # a sweep per 45 s is plenty; the jobs run it too
     rows = data.list_offers(db, tenant_id, user)
     if staff and st.toggle("Only offers I placed", False, key="offers_mine",
                            help="Offers you entered on a farmer's behalf. Off shows the whole company's."):
@@ -1349,7 +1370,7 @@ def main() -> None:
         st.error("The portal can't reach its database. Please contact JSA support.")
         _stop()
     slug = (st.query_params.get("t") or "").strip().lower()
-    tenant = data.get_tenant(db, slug) if slug else None
+    tenant = _kept(f"_k_tenant_{slug}", 30, lambda: data.get_tenant(db, slug)) if slug else None
     real = st.session_state.get("user")
     jsa = bool(real) and real["role"] == "platform_admin"
     if not tenant:
@@ -1377,12 +1398,16 @@ def main() -> None:
     with st.sidebar:
         st.caption(f"{user['email']} · {user['role'].replace('_', ' ')}")
         if user["role"] != "platform_admin" and not user.get("_preview"):
-            row = db.query("SELECT notify_email FROM users WHERE user_id = %s", (user["user_id"],))
-            was = bool(row) and row[0]["notify_email"] in (None, 1, True)
+            pref = f"_notify_{user['user_id']}"                   # read once per session, then it is the toggle's own state
+            if pref not in st.session_state:
+                row = db.query("SELECT notify_email FROM users WHERE user_id = %s", (user["user_id"],))
+                st.session_state[pref] = (not row) or row[0]["notify_email"] in (None, 1, True)
+            was = st.session_state[pref]
             now = st.toggle("Email me notifications", was, key="notify_pref",
                             help="Offer updates, and the end-of-day recap for staff and admins.")
             if now != was:
                 notify.set_notify(db, user["user_id"], now)
+                st.session_state[pref] = now
         if st.button("Sign out"):
             for k in ("user", "tenant_id", "login_step"):
                 st.session_state.pop(k, None)

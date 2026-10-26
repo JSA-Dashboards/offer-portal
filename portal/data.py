@@ -178,12 +178,27 @@ def list_bids(db: Db, tenant_id: str, grain: str | None = None) -> list[dict]:
     return rows
 
 
+def _actor(db: Db, actor_id: int) -> dict | None:
+    """The acting user's {tenant_id, role} (active users only), re-read from the database, not trusted from the UI.
+    Every guarded call needs it, and a page makes several: where `db.actor_ttl` is set (the app sets a few seconds)
+    a found row is reused that long, so a role change takes effect within that window. Misses are never cached."""
+    ttl = getattr(db, "actor_ttl", 0)
+    cache = db.__dict__.setdefault("_actor_cache", {})
+    hit = cache.get(actor_id)
+    if ttl and hit and time.monotonic() - hit[0] < ttl:
+        return hit[1]
+    r = db.query("SELECT tenant_id, role FROM users WHERE user_id = %s AND active", (actor_id,))
+    if r and ttl:
+        cache[actor_id] = (time.monotonic(), r[0])
+    return r[0] if r else None
+
+
 def _require_staff(db: Db, tenant_id: str, actor_id: int) -> None:
     """Elevator staff of this tenant (admins included), or a JSA platform admin: offers, purchases, farmers.
     Changing the bid board itself (publish, retire, review scraped bids) is _require_admin."""
-    r = db.query("SELECT tenant_id, role FROM users WHERE user_id = %s AND active", (actor_id,))
-    ok = r and (r[0]["role"] == "platform_admin"
-                or (r[0]["tenant_id"] == tenant_id and r[0]["role"] in ELEVATOR_ROLES))
+    r = _actor(db, actor_id)
+    ok = r and (r["role"] == "platform_admin"
+                or (r["tenant_id"] == tenant_id and r["role"] in ELEVATOR_ROLES))
     if not ok:
         raise PortalError("Elevator staff only.")
 
@@ -871,9 +886,9 @@ def create_tenant(db: Db, actor: dict, tenant_id: str, name: str, **fields) -> N
 
 # ── Hit -> completed (archive), hedging, summary ─────────────────────────────
 def _require_admin(db: Db, tenant_id: str, actor_id: int) -> None:
-    r = db.query("SELECT tenant_id, role FROM users WHERE user_id = %s AND active", (actor_id,))
-    if not r or not (r[0]["role"] == "platform_admin"
-                     or (r[0]["tenant_id"] == tenant_id and r[0]["role"] == "elevator_admin")):
+    r = _actor(db, actor_id)
+    if not r or not (r["role"] == "platform_admin"
+                     or (r["tenant_id"] == tenant_id and r["role"] == "elevator_admin")):
         raise PortalError("Elevator admin only.")
 
 
