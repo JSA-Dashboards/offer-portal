@@ -105,3 +105,15 @@ def test_jsa_admin_can_mark_an_offer_hit_in_any_tenant_and_the_previews_too(db):
     other = {**conftest.user(db, 4)}                                               # another tenant's admin still can't
     with pytest.raises(PortalError):
         data.act_on_offer(db, "rcm", other, offer(), "hit")
+
+
+def test_a_failed_code_email_says_what_kind_of_failure_it_was(app_db, monkeypatch):
+    def boom(*a, **k):
+        raise TimeoutError("secret detail that must not be shown")
+    monkeypatch.setattr(auth, "request_code", boom)
+    at = AppTest.from_file("app.py", default_timeout=20)
+    at.query_params["t"] = "rcm"
+    at.run()
+    next(t for t in at.text_input if t.label == "Email").set_value("admin@rcm.com")
+    next(b for b in at.button if b.label == "Send code").click().run()
+    assert any("TimeoutError" in e.value and "secret detail" not in e.value for e in at.error)

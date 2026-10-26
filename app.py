@@ -8,6 +8,7 @@ farmer (the bid board read-only, their own offers, delayed futures, the USDA cal
 from __future__ import annotations
 
 import html
+import logging
 import os
 import pathlib
 import re
@@ -179,8 +180,10 @@ def login_view(db, tenant: dict | None) -> None:
         if go:
             try:
                 auth.request_code(db, email, tenant["tenant_id"] if tenant else None, _send_code(tenant))
-            except Exception:
-                st.error("We couldn't send the code. Please try again shortly.")
+            except Exception as exc:
+                logging.getLogger("offer_portal").exception("sign-in code could not be sent")
+                # The exception's type (never its message, which could carry settings) helps support find the cause.
+                st.error(f"We couldn't send the code ({type(exc).__name__}). Please try again shortly.")
                 return
             st.session_state.update(login_step="code", login_email=email.strip().lower())
             st.rerun()
