@@ -75,7 +75,8 @@ def create_tenant(db: Db, actor_id: int, slug: str, name: str, first_admin_email
 
 def update_tenant(db: Db, actor_id: int, tenant_id: str, *, name: str, logo_url: str | None,
                   primary_color: str, accent_color: str, support_email: str | None,
-                  from_name: str | None, open_pricing: bool, hedging_enabled: bool, show_futures: bool = False) -> None:
+                  from_name: str | None, open_pricing: bool, hedging_enabled: bool, show_futures: bool = False,
+                  sms_enabled: bool | None = None, sms_from: str | None = None) -> None:
     _admin(db, actor_id)
     _tenant(db, tenant_id)
     if not name.strip():
@@ -91,6 +92,18 @@ def update_tenant(db: Db, actor_id: int, tenant_id: str, *, name: str, logo_url:
                "WHERE tenant_id = %s",
                (name.strip(), logo, primary_color, accent_color, email, (from_name or "").strip() or None,
                 open_pricing, hedging_enabled, show_futures, tenant_id))
+    if sms_enabled is not None:                           # text messages: only touched when the caller says so
+        from . import notify, sms
+        number = None
+        if (sms_from or "").strip():
+            number = sms.normalize_phone(sms_from)
+            if not number:
+                raise PortalError("The texting number must look like +15551234567.")
+        if not notify.sms_ready(db):
+            raise PortalError("Run sql/12_sms.sql first: the texting columns don't exist yet.")
+        db.execute("UPDATE tenants SET sms_enabled = %s, sms_from = %s WHERE tenant_id = %s",
+                   (bool(sms_enabled), number, tenant_id))
+        _audit(db, tenant_id, actor_id, "tenant_sms", dict(sms_enabled=bool(sms_enabled), own_number=bool(number)))
     _audit(db, tenant_id, actor_id, "tenant_updated", dict(open_pricing=open_pricing,
                                                            hedging_enabled=hedging_enabled,
                                                            show_futures=show_futures))

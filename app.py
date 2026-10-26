@@ -26,7 +26,7 @@ except Exception:
     pass
 
 import scrape_run
-from portal import auth, contracts, usda_calendar, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
+from portal import auth, contracts, sms, usda_calendar, data, farmers, futures, massive, notify, people, platform, purchases, recap, theme
 from portal.db import connect
 
 GRAINS = contracts.GRAINS
@@ -126,6 +126,37 @@ def _send_code(tenant: dict | None):
         else:
             raise RuntimeError("Email is not configured.")
     return send
+
+
+def sms_settings(db, user: dict, tenant: dict) -> None:
+    """Sidebar: a person's own text-alert consent. Shown only where texting is on for the elevator."""
+    tid = tenant["tenant_id"]
+    cfg = _kept(f"_k_sms_{tid}", 60, lambda: notify.tenant_sms(db, tid))
+    if not cfg:
+        return
+    me = _kept(f"_k_smsu_{user['user_id']}", 60, lambda: db.query(
+        "SELECT phone, sms_opt_in_at FROM users WHERE user_id = %s", (user["user_id"],))[0])
+    on = bool(me["sms_opt_in_at"])
+    with st.expander("Text alerts" + (" (on)" if on else "")):
+        if user["role"] == "farmer":
+            st.caption("Texts when your offer is hit, completed, cancelled or expires.")
+        else:
+            st.caption("Texts when a new offer comes in and when an offer is hit.")
+        phone = st.text_input("Mobile number", sms.pretty(me["phone"]), key="sms_phone", placeholder="(555) 123-4567")
+        agree = st.checkbox(f"I agree to receive text messages from {cfg['name']} about offers. Message and data rates may "
+                            "apply. Reply STOP to end, HELP for help.", value=on, key="sms_agree")
+        if st.button("Save text settings", key="sms_save"):
+            try:
+                notify.set_sms_optin(db, user["user_id"], phone, agree)
+                st.session_state.pop(f"_k_smsu_{user['user_id']}", None)
+                _flush_mail()
+                st.session_state["sms_msg"] = ("Text alerts are on. A confirmation text is on its way." if agree
+                                               else "Text alerts are off.")
+                st.rerun()                                   # so the header above reflects the new state
+            except data.PortalError as e:
+                st.error(str(e))
+        if msg := st.session_state.pop("sms_msg", None):
+            st.success(msg)
 
 
 def password_form(db, user: dict, key: str, current_needed: bool = False) -> bool:
@@ -293,6 +324,10 @@ def _flush_mail() -> None:
         if db.query("SELECT 1 AS x FROM notifications WHERE status IN ('queued', 'failed') AND attempts < %s LIMIT 1",
                     (notify.MAX_ATTEMPTS,)):
             notify.send_pending(db, limit=10)
+        if sms.ready() and notify.sms_ready(db) and db.query(
+                "SELECT 1 AS x FROM sms_queue WHERE status IN ('queued', 'failed') AND attempts < %s LIMIT 1",
+                (notify.MAX_ATTEMPTS,)):
+            notify.send_pending_sms(db, limit=10)
     except Exception:
         pass
 
@@ -300,7 +335,7 @@ def _flush_mail() -> None:
 def _refresh() -> None:
     """Rerun just the calling fragment; a full rerun when not in a fragment run (e.g. AppTest)."""
     _flush_mail()
-    for k in [k for k in st.session_state if str(k).startswith(("_k_pf_", "_k_tenant", "_k_locs_"))]:
+    for k in [k for k in st.session_state if str(k).startswith(("_k_pf_", "_k_tenant", "_k_locs_", "_k_sms"))]:
         st.session_state.pop(k, None)                  # people / tenants may have just changed
     try:
         get_db().__dict__.get("_actor_cache", {}).clear()   # so a role change just made takes effect now
@@ -890,12 +925,19 @@ def _tenant_editor(db, user: dict, t: dict) -> None:
         hedging = c6.toggle("Hedging enabled (phase 2)", bool(t["hedging_enabled"]))
         show_fut = st.toggle("Farmers can see delayed futures quotes (staff always can; check market-data licensing)",
                              bool(t.get("show_futures")))
+        sms_on = sms_from = None
+        if notify.sms_ready(db):
+            c7, c8 = st.columns(2)
+            sms_on = c7.toggle("Text alerts on for this elevator", bool(t.get("sms_enabled")),
+                               help="Also needs JSA's texting set up (SMS_ENABLED and the Twilio settings). People still opt in themselves.")
+            sms_from = c8.text_input("This elevator's own texting number (blank = JSA's shared number)",
+                                     t.get("sms_from") or "", placeholder="+15551234567")
         if st.form_submit_button("Save settings", type="primary"):
             try:
                 platform.update_tenant(db, uid, tid, name=name, logo_url=logo, primary_color=primary,
                                        accent_color=accent, support_email=support, from_name=from_name,
                                        open_pricing=open_pricing, hedging_enabled=hedging,
-                                       show_futures=show_fut)
+                                       show_futures=show_fut, sms_enabled=sms_on, sms_from=sms_from)
                 st.success("Saved.")
             except data.PortalError as e:
                 st.error(str(e))
@@ -1480,6 +1522,8 @@ def main() -> None:
             if now != was:
                 notify.set_notify(db, user["user_id"], now)
                 st.session_state[pref] = now
+        if user["role"] != "platform_admin" and not user.get("_preview"):
+            sms_settings(db, user, tenant)
         if auth.passwords_ready(db) and not user.get("_preview"):
             with st.expander("Password"):
                 if password_form(db, real or user, "change_pw", current_needed=auth.has_password(db, user["user_id"])):

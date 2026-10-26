@@ -55,3 +55,17 @@ Settings (env or Streamlit secrets): `SNOWFLAKE_ACCOUNT/USER/ROLE/WAREHOUSE/DATA
 
 ## Not built yet
 Futures job schedule + Massive key, notifications, e-signed contracts, ERP/position export, QST hedge bridge (phase 2).
+
+## Text messages (built, off until JSA registers its number)
+
+Texts ride the same events as email: farmers on hit / completed / cancelled / expired; staff and admins on new offer / hit.
+The daily recap stays email-only. Only people who opted in (their own consent, in the sidebar: number + agreement, time recorded)
+are texted; every text says how to stop; a STOP reply (Twilio error 21610) clears the person's opt-in automatically.
+
+To switch on:
+1. Create a Twilio account; register the **brand and campaign (A2P 10DLC)** with US carriers (days to weeks) and buy a number.
+2. Run `sql/12_sms.sql` (opt-in columns, per-elevator switch/number, the `sms_queue` outbox). The app works without it.
+3. Add the secrets: `SMS_ENABLED = "1"`, `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_FROM` (JSA's shared number) or
+   `TWILIO_MESSAGING_SERVICE_SID`. Put the same on the droplet's `.env` so `notify_run.py` can send texts too.
+4. Platform -> Tenants -> an elevator -> **Text alerts on** (JSA Test Elevator first). Optional: that elevator's own number
+   (its own 10DLC registration) in the field below; blank uses JSA's shared number.

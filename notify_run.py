@@ -18,4 +18,4 @@ if __name__ == "__main__":
     logging.getLogger("snowflake").setLevel(logging.WARNING)
     db = connect()
     expired = data.expire_all_tenants(db)               # offers past their last delivery day expire (and queue their email)
-    print(json.dumps(dict(expired=expired, **notify.send_pending(db, limit=200)), default=str))
+    print(json.dumps(dict(expired=expired, **notify.flush_all(db, limit=200)), default=str))

@@ -13,6 +13,9 @@ CREATE TABLE futures_quotes (symbol TEXT PRIMARY KEY, price REAL, as_of TEXT,
 CREATE TABLE notifications (notification_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, to_email TEXT, to_name TEXT,
   user_id INT, offer_id INT, dedupe_key TEXT, subject TEXT, body_html TEXT, status TEXT DEFAULT 'queued', attempts INT DEFAULT 0,
   error TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, sent_at TEXT);
+CREATE TABLE sms_queue (sms_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, to_phone TEXT, to_name TEXT, user_id INT,
+  offer_id INT, dedupe_key TEXT, body TEXT, from_number TEXT, status TEXT DEFAULT 'queued', attempts INT DEFAULT 0, error TEXT,
+  provider_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, sent_at TEXT);
 CREATE TABLE purchases (purchase_id INTEGER PRIMARY KEY, tenant_id TEXT, purchase_date TEXT, staff_user_id INT, farmer_id INT,
   counterparty TEXT, grain TEXT, bushels INT, price REAL, basis_cents INT, futures_symbol TEXT, location_id INT,
   delivery_location TEXT, delivery_period TEXT, contract_ref TEXT, note TEXT, voided_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
@@ -25,9 +28,11 @@ CREATE TABLE invites (token_hash TEXT PRIMARY KEY, tenant_id TEXT, email TEXT, r
   invited_by INT, farmer_id INT, expires_at TEXT, used INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE tenants (tenant_id TEXT PRIMARY KEY, name TEXT, status TEXT DEFAULT 'active', logo_url TEXT,
   primary_color TEXT, accent_color TEXT, support_email TEXT, from_name TEXT,
-  hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, show_futures INT DEFAULT 0, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+  hedging_enabled INT DEFAULT 0, open_pricing INT DEFAULT 1, show_futures INT DEFAULT 0,
+  sms_enabled INT DEFAULT 0, sms_from TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE locations (location_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, state TEXT, active INT DEFAULT 1);
 CREATE TABLE users (user_id INTEGER PRIMARY KEY, tenant_id TEXT, email TEXT, name TEXT, role TEXT, active INT DEFAULT 1, invited_by INT, notify_email INT DEFAULT 1,
+  phone TEXT, sms_opt_in_at TEXT,
   password_hash TEXT, password_set_at TEXT, failed_logins INT DEFAULT 0, locked_until TEXT);
 CREATE TABLE bid_suggestions (suggestion_id INTEGER PRIMARY KEY, tenant_id TEXT, location_id INT, grain TEXT,
   delivery_month TEXT, delivery_start TEXT, delivery_end TEXT, futures_symbol TEXT, basis_cents INT, cash_price REAL, source TEXT,

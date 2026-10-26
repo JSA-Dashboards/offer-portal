@@ -173,4 +173,180 @@ def offer_event(db: Db, tenant_id: str, kind: str, offer_id: int, **ctx) -> int:
     for rcpts, subject, body in plan:
         for r in rcpts:
             n += queue(db, tenant_id, kind, r, subject, body, offer_id=offer_id, dedupe_key=f"{kind}:{offer_id}")
+    try:
+        sms_offer_event(db, tenant, kind, o, farmer, ctx)       # texts ride along; never at the cost of the emails
+    except Exception:
+        pass
     return n
+
+
+# ── text messages ───────────────────────────────────────────────────────────────
+# Who is texted about what: farmers on hit / completed / cancelled / expired; staff and admins on new offer / hit.
+# Only people who opted in (their own consent, in the sidebar), only for elevators switched on in Platform, only while
+# SMS_ENABLED=1 and the Twilio settings exist. The daily recap stays email-only.
+SMS_FARMER = ("offer_hit", "offer_completed", "offer_cancelled", "offer_expired")
+SMS_STAFF = ("offer_submitted", "offer_hit")
+STOP_LINE = " Reply STOP to end texts."
+
+
+def sms_ready(db: Db) -> bool:
+    """True once sql/12 has run (the opt-in columns and the outbox exist). A miss is re-checked after a minute, so the
+    code can be deployed before the SQL without breaking anything."""
+    import time
+    now = time.monotonic()
+    state = getattr(db, "_sms_ready", None)
+    if state and (state[0] or now - state[1] < 60):
+        return state[0]
+    try:
+        db.query("SELECT phone, sms_opt_in_at FROM users LIMIT 1")
+        db.query("SELECT sms_enabled, sms_from FROM tenants LIMIT 1")
+        db.query("SELECT sms_id FROM sms_queue LIMIT 1")
+        ok = True
+    except Exception:
+        ok = False
+    db._sms_ready = (ok, now)
+    return ok
+
+
+def tenant_sms(db: Db, tenant_id: str) -> dict | None:
+    """{'from': this elevator's own number or None, 'name': display name} when texting is on for it, else None."""
+    from . import sms
+    if not (sms.ready() and sms_ready(db)):
+        return None
+    r = db.query("SELECT name, from_name, sms_enabled, sms_from FROM tenants WHERE tenant_id = %s", (tenant_id,))
+    if not r or r[0]["sms_enabled"] not in (1, True):
+        return None
+    return dict(name=(r[0]["from_name"] or r[0]["name"] or tenant_id), **{"from": r[0]["sms_from"] or None})
+
+
+def queue_sms(db: Db, tenant_id: str, kind: str, to: dict, body: str, *, offer_id=None, dedupe_key: str | None = None,
+              from_number: str | None = None) -> bool:
+    """Queue one text. False (and nothing queued) for an unusable number or a duplicate (same key + number)."""
+    from . import sms
+    phone = sms.normalize_phone(to.get("phone"))
+    if not phone:
+        return False
+    if dedupe_key and db.query("SELECT 1 AS x FROM sms_queue WHERE tenant_id = %s AND dedupe_key = %s AND to_phone = %s",
+                               (tenant_id, dedupe_key, phone)):
+        return False
+    _insert(db, "sms_queue", dict(sms_id=new_id(), tenant_id=tenant_id, kind=kind, to_phone=phone, to_name=to.get("name"),
+                                  user_id=to.get("user_id"), offer_id=offer_id, dedupe_key=dedupe_key,
+                                  body=body[:600], from_number=from_number))
+    return True
+
+
+def _optin_users(db: Db, tenant_id: str, roles: tuple[str, ...]) -> list[dict]:
+    marks = ", ".join(["%s"] * len(roles))
+    return db.query(f"SELECT user_id, name, phone, role FROM users WHERE tenant_id = %s AND active AND role IN ({marks}) "
+                    f"AND sms_opt_in_at IS NOT NULL AND phone IS NOT NULL ORDER BY user_id", (tenant_id, *roles))
+
+
+def _sms_text(name: str, kind: str, o: dict) -> str:
+    bu, grain = f"{o['bushels']:,} bu {o['grain']}", o["grain"]
+    farmer = o.get("farmer_name") or "a farmer"
+    if kind == "offer_submitted":
+        px = f"${o['price']:.2f}" if o["price_type"] == "FIXED" else f"{o['basis_cents']:+d}c {o['futures_symbol']}"
+        return f"{name}: new offer, {farmer}, {bu} at {px}."
+    if kind == "offer_hit":
+        return f"{name}: HIT, {farmer}, {bu}. Acknowledge it in the portal."
+    return ""
+
+
+def _farmer_sms_text(name: str, kind: str, o: dict) -> str:
+    bu = f"{o['bushels']:,} bu {o['grain']}"
+    return {"offer_hit": f"{name}: your offer was hit, {bu}. We'll confirm your contract shortly.",
+            "offer_completed": f"{name}: contract confirmed, {bu}" + (f", #{o['contract_ref']}." if o.get("contract_ref") else "."),
+            "offer_cancelled": f"{name}: your offer ({bu}) was cancelled. Please contact us.",
+            "offer_expired": f"{name}: your offer ({bu}) expired unfilled."}.get(kind, "")
+
+
+def sms_offer_event(db: Db, tenant: dict, kind: str, o: dict, farmer: dict | None, ctx: dict) -> int:
+    """Queue the texts for one offer event (see the rules above). Returns how many were queued."""
+    tid = tenant["tenant_id"]
+    cfg = tenant_sms(db, tid)
+    if not cfg:
+        return 0
+    n, fr, label = 0, cfg["from"], f"{kind}:{o['offer_id']}"
+    if kind in SMS_STAFF:
+        text = _sms_text(cfg["name"], kind, o) + STOP_LINE
+        for u in _optin_users(db, tid, ("elevator_admin", "elevator_staff")):
+            if kind == "offer_submitted" and u["user_id"] == o.get("placed_by"):
+                continue                                    # the person who entered it knows
+            n += queue_sms(db, tid, kind, u, text, offer_id=o["offer_id"], dedupe_key=label, from_number=fr)
+    if kind in SMS_FARMER and farmer and farmer.get("user_id"):
+        text = _farmer_sms_text(cfg["name"], kind, o) + STOP_LINE
+        for u in _optin_users(db, tid, ("farmer",)):
+            if u["user_id"] == farmer["user_id"]:
+                n += queue_sms(db, tid, kind, u, text, offer_id=o["offer_id"], dedupe_key=label, from_number=fr)
+    return n
+
+
+def send_pending_sms(db: Db, send=None, limit: int = 25) -> dict:
+    """Deliver queued (and failed, under MAX_ATTEMPTS) texts. `send(to, body, from_number)` defaults to Twilio; nothing
+    is sent, and the queue is left alone, unless texting is switched on. A STOP reply (Twilio error 21610) clears that
+    person's opt-in so they are never texted again until they opt in afresh."""
+    from . import sms
+    if send is None:
+        if not (sms.ready() and sms_ready(db)):
+            return dict(sent=0, failed=0, skipped="texting is not switched on; texts stay queued")
+        send = sms.send
+    elif not sms_ready(db):
+        return dict(sent=0, failed=0, skipped="sql/12 has not been run")
+    rows = db.query("SELECT sms_id, to_phone, body, from_number, user_id, attempts FROM sms_queue "
+                    "WHERE status IN ('queued', 'failed') AND attempts < %s ORDER BY sms_id", (MAX_ATTEMPTS,))[:limit]
+    sent = failed = 0
+    for r in rows:
+        try:
+            pid = send(r["to_phone"], r["body"], r["from_number"])
+            db.execute("UPDATE sms_queue SET status = 'sent', sent_at = CURRENT_TIMESTAMP(), attempts = attempts + 1, "
+                       "error = NULL, provider_id = %s WHERE sms_id = %s", (pid or None, r["sms_id"]))
+            sent += 1
+        except sms.StopRequested as exc:
+            if r["user_id"]:
+                db.execute("UPDATE users SET sms_opt_in_at = NULL WHERE user_id = %s", (r["user_id"],))
+            db.execute("UPDATE sms_queue SET status = 'opted_out', attempts = attempts + 1, error = %s WHERE sms_id = %s",
+                       (str(exc)[:400], r["sms_id"]))
+            failed += 1
+        except Exception as exc:
+            db.execute("UPDATE sms_queue SET status = 'failed', attempts = attempts + 1, error = %s WHERE sms_id = %s",
+                       (f"{type(exc).__name__}: {exc}"[:400], r["sms_id"]))
+            failed += 1
+    return dict(sent=sent, failed=failed)
+
+
+def set_sms_optin(db: Db, user_id: int, phone: str | None, on: bool) -> None:
+    """A person turns their own text alerts on (with their number: this is their consent, recorded with the time) or off.
+    Turning on queues a confirmation text that says how to stop."""
+    from . import sms
+    from .data import PortalError, _audit
+    if not sms_ready(db):
+        raise PortalError("Text alerts aren't switched on yet.")
+    u = db.query("SELECT user_id, tenant_id, name FROM users WHERE user_id = %s AND active", (user_id,))
+    if not u or not u[0]["tenant_id"]:
+        raise PortalError("Text alerts are for elevator staff and farmers.")
+    tid = u[0]["tenant_id"]
+    if not on:
+        db.execute("UPDATE users SET sms_opt_in_at = NULL WHERE user_id = %s", (user_id,))
+        _audit(db, tid, user_id, "sms_opt_out", {})
+        return
+    cfg = tenant_sms(db, tid)
+    if not cfg:
+        raise PortalError("Text alerts aren't switched on for your elevator yet.")
+    number = sms.normalize_phone(phone)
+    if not number:
+        raise PortalError("Enter a mobile number with its area code, like (555) 123-4567.")
+    before = db.query("SELECT phone, sms_opt_in_at FROM users WHERE user_id = %s", (user_id,))[0]
+    already = bool(before["sms_opt_in_at"]) and before["phone"] == number
+    db.execute("UPDATE users SET phone = %s, sms_opt_in_at = CURRENT_TIMESTAMP() WHERE user_id = %s", (number, user_id))
+    _audit(db, tid, user_id, "sms_opt_in", {})
+    if not already:                                         # saving the same settings again does not text them again
+        queue_sms(db, tid, "sms_optin", dict(phone=number, name=u[0]["name"], user_id=user_id),
+                  f"{cfg['name']}: you're signed up for offer text alerts. Msg & data rates may apply. "
+                  f"Reply STOP to end, HELP for help.", from_number=cfg["from"])
+
+
+def flush_all(db: Db, limit: int = 25) -> dict:
+    """Email and texts in one go (what the app and the droplet job call)."""
+    out = send_pending(db, limit=limit)
+    out["sms"] = send_pending_sms(db, limit=limit)
+    return out
