@@ -84,11 +84,13 @@ def _may_see_futures(tenant: dict | None, user: dict) -> bool:
     return user["role"] != "farmer" or bool((tenant or {}).get("show_futures"))
 
 
-def _send_code(tenant: dict):
+def _send_code(tenant: dict | None):
+    name = tenant["name"] if tenant else "JSA Offer Portal"
+
     def send(email: str, code: str) -> None:
         if auth.graph_configured():
             auth.send_via_graph(
-                email, f"Your {tenant['name']} sign-in code",
+                email, f"Your {name} sign-in code",
                 f"<p>Your sign-in code is <b>{code}</b>. It expires in 10 minutes.</p>")
         elif DEV:
             st.session_state["_dev_code"] = code          # local development only
@@ -97,7 +99,59 @@ def _send_code(tenant: dict):
     return send
 
 
-def login_view(db, tenant: dict) -> None:
+def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
+    """JSA super admin: jump to any tenant and look at the portal as an elevator admin, staff or a farmer.
+    Returns the user the page should be drawn for. Admin/staff previews keep your own identity (anything you do is
+    recorded as you); a farmer preview shows that farmer's own pages, read-only."""
+    tenants = platform.list_tenants(db, real["user_id"])
+    slugs = [t["tenant_id"] for t in tenants]
+    names = {t["tenant_id"]: t["name"] for t in tenants}
+    with st.sidebar:
+        st.markdown("**JSA tools**")
+        pick = st.selectbox("Tenant", slugs, index=slugs.index(tenant["tenant_id"]) if tenant["tenant_id"] in slugs else 0,
+                            format_func=names.get, key="jsa_tenant")
+        if pick != tenant["tenant_id"]:
+            st.query_params["t"] = pick
+            st.session_state.pop("view_as", None)
+            st.rerun()
+        lens = st.radio("View as", ["JSA admin (me)", "Elevator admin", "Elevator staff", "Farmer"], key="view_as")
+        farmer = None
+        if lens == "Farmer":
+            fl = platform.preview_farmers(db, real["user_id"], tenant["tenant_id"])
+            if fl:
+                farmer = st.selectbox("Which farmer", fl, format_func=lambda u: u["farmer_name"], key="view_as_farmer")
+            else:
+                st.caption("No farmer here has a login yet, so there is nothing to show as a farmer.")
+    if lens == "Elevator admin":
+        return {**real, "role": "elevator_admin", "_preview": "elevator admin"}
+    if lens == "Elevator staff":
+        return {**real, "role": "elevator_staff", "_preview": "elevator staff"}
+    if lens == "Farmer":
+        if farmer:
+            return {**farmer, "_preview": f"farmer {farmer['farmer_name']} (read-only)"}
+        st.info("Pick a farmer with a login to preview the farmer pages.")
+        _stop(tenant)
+    return real
+
+
+def console_view(db, real: dict) -> None:
+    """JSA super admin signed in without a tenant link: pick a tenant, or run the platform pages."""
+    st.subheader("JSA console")
+    tenants = platform.list_tenants(db, real["user_id"])
+    for t in tenants:
+        c1, c2 = st.columns([4, 1])
+        c1.markdown(f"**{t['name']}** · `{t['tenant_id']}` · {t['users']} users · {t['status']}")
+        c2.link_button("Open", f"?t={t['tenant_id']}")
+    platform_view(db, real)
+    with st.sidebar:
+        st.caption(f"{real['email']} · platform admin")
+        if st.button("Sign out"):
+            for k in ("user", "tenant_id", "login_step"):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+
+def login_view(db, tenant: dict | None) -> None:
     st.caption("Sign in with your email — we'll send you a one-time code.")
     step = st.session_state.get("login_step", "email")
     if step == "email":
@@ -106,7 +160,7 @@ def login_view(db, tenant: dict) -> None:
             go = st.form_submit_button("Send code", type="primary")
         if go:
             try:
-                auth.request_code(db, email, tenant["tenant_id"], _send_code(tenant))
+                auth.request_code(db, email, tenant["tenant_id"] if tenant else None, _send_code(tenant))
             except Exception:
                 st.error("We couldn't send the code. Please try again shortly.")
                 return
@@ -120,9 +174,9 @@ def login_view(db, tenant: dict) -> None:
             code = st.text_input("6-digit code")
             go = st.form_submit_button("Sign in", type="primary")
         if go:
-            u = auth.verify_code(db, st.session_state["login_email"], code, tenant["tenant_id"])
+            u = auth.verify_code(db, st.session_state["login_email"], code, tenant["tenant_id"] if tenant else None)
             if u:
-                st.session_state.update(user=u, tenant_id=tenant["tenant_id"])
+                st.session_state.update(user=u, tenant_id=tenant["tenant_id"] if tenant else None)
                 st.session_state.pop("login_step", None)
                 st.session_state.pop("_dev_code", None)
                 st.rerun()
@@ -357,6 +411,9 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
         contract_ref = st.text_input("Contract reference # (optional)", max_chars=60)
         note = st.text_area("Notes" if farmer_id else "Notes to the elevator", max_chars=500)
         if st.form_submit_button("Enter offer" if farmer_id else "Send offer", type="primary"):
+            if user.get("_preview") and user["role"] == "farmer":
+                st.warning("You are previewing as a farmer: offers can't be sent from here.")
+                return
             if bool(start) != bool(end) or (not bid and not (start and end)):
                 st.error("Enter the delivery period (first and last day). The offer expires the day after the last day.")
                 return
@@ -448,6 +505,9 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
             with st.container(horizontal=True):
                 for lbl, act, kind in acts:
                     if st.button(lbl, key=f"{act}_{key}", type=kind):
+                        if user.get("_preview") and user["role"] == "farmer":
+                            st.warning("You are previewing as a farmer: offers can't be changed from here.")
+                            continue
                         try:
                             data.act_on_offer(db, tenant_id, user, o["offer_id"], act,
                                               on_behalf=staff and act == "withdraw")
@@ -700,7 +760,26 @@ def _tenant_editor(db, user: dict, t: dict) -> None:
 @st.fragment
 def platform_view(db, user: dict) -> None:
     uid = user["user_id"]
-    section = st.radio("Section", ["Tenants", "Usage report"], horizontal=True, label_visibility="collapsed")
+    section = st.radio("Section", ["Tenants", "Usage report", "JSA admins"], horizontal=True, label_visibility="collapsed")
+    if section == "JSA admins":
+        st.caption("JSA super admins can open every tenant and preview each role. They sign in with an emailed code.")
+        for a in platform.list_platform_admins(db, uid):
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"{a['name'] or '—'} · {a['email']}" + ("" if a["active"] else " · *turned off*"))
+            if a["user_id"] != uid and c2.button("Turn off" if a["active"] else "Turn on", key=f"pa_{a['user_id']}"):
+                platform.set_platform_admin_active(db, uid, a["user_id"], not a["active"])
+                _refresh()
+        with st.form("add_jsa_admin", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            nm, em = c1.text_input("Name"), c2.text_input("Email (@jpsi.com)")
+            if st.form_submit_button("Add JSA admin", type="primary"):
+                try:
+                    platform.add_platform_admin(db, uid, em, nm)
+                except data.PortalError as e:
+                    st.error(str(e))
+                else:
+                    st.success(f"{em.strip().lower()} can now sign in.")
+        return
     if section == "Usage report":
         month = st.text_input("Month (YYYY-MM)", data.today_ct().strftime("%Y-%m"))
         try:
@@ -1147,14 +1226,21 @@ def main() -> None:
         _stop()
     slug = (st.query_params.get("t") or "").strip().lower()
     tenant = data.get_tenant(db, slug) if slug else None
+    real = st.session_state.get("user")
+    jsa = bool(real) and real["role"] == "platform_admin"
     if not tenant:
         _brand(None)
+        if jsa:
+            console_view(db, real)
+            _stop()
         st.info("Please use the link your elevator gave you.")
+        with st.expander("JSA staff sign in"):
+            login_view(db, None)
         _stop()
     _brand(tenant)
 
-    user = st.session_state.get("user")
-    if not user or st.session_state.get("tenant_id") != tenant["tenant_id"]:
+    user = real
+    if not user or (st.session_state.get("tenant_id") != tenant["tenant_id"] and not jsa):
         st.session_state.pop("user", None)
         if st.query_params.get("invite"):
             join_view(db, tenant, st.query_params["invite"])
@@ -1162,9 +1248,11 @@ def main() -> None:
             login_view(db, tenant)
         _stop(tenant)
 
+    if jsa:
+        user = jsa_sidebar(db, real, tenant)
     with st.sidebar:
         st.caption(f"{user['email']} · {user['role'].replace('_', ' ')}")
-        if user["role"] != "platform_admin":
+        if user["role"] != "platform_admin" and not user.get("_preview"):
             row = db.query("SELECT notify_email FROM users WHERE user_id = %s", (user["user_id"],))
             was = bool(row) and row[0]["notify_email"] in (None, 1, True)
             now = st.toggle("Email me notifications", was, key="notify_pref",
@@ -1185,6 +1273,8 @@ def main() -> None:
              else ["Bid board", "Make an offer", "My offers", "USDA calendar"])
     if user["role"] == "platform_admin":
         views = views + ["Platform"]
+    if user.get("_preview"):
+        st.warning(f"Previewing as {user['_preview']}. Nothing here is saved as them; switch back in the sidebar.")
     view = st.radio("View", views, horizontal=True, label_visibility="collapsed")
     if view == "Platform":
         platform_view(db, user)

@@ -14,6 +14,7 @@ from .db import Db
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{1,30}$")
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
+_EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 RESERVED = {"admin", "api", "www", "platform", "jsa", "static", "login"}
 SOURCE_KINDS = ("agricharts", "bushelsites")
 
@@ -165,3 +166,43 @@ def usage_table(db: Db, actor_id: int, month: str) -> list[dict]:
     for v in table.values():
         v.setdefault("active_farmers", 0)
     return list(table.values())
+
+
+# ── JSA platform admins ─────────────────────────────────────────────────────
+def list_platform_admins(db: Db, actor_id: int) -> list[dict]:
+    _admin(db, actor_id)
+    return db.query("SELECT user_id, email, name, active FROM users WHERE role = 'platform_admin' ORDER BY email")
+
+
+def add_platform_admin(db: Db, actor_id: int, email: str, name: str | None = None) -> None:
+    """A new JSA super admin. They sign in with an emailed code like everyone else. Existing accounts are refused
+    (an email belongs to one account and one role)."""
+    _admin(db, actor_id)
+    email = (email or "").strip().lower()
+    if not _EMAIL.match(email):
+        raise PortalError("Enter a valid email address.")
+    if not email.endswith("@jpsi.com"):
+        raise PortalError("JSA super admins must have a @jpsi.com address.")
+    if db.query("SELECT 1 AS x FROM users WHERE LOWER(email) = %s", (email,)):
+        raise PortalError("That email already has an account.")
+    _insert(db, "users", dict(tenant_id=None, email=email, name=(name or "").strip() or None,
+                              role="platform_admin", invited_by=actor_id))
+    _audit(db, None, actor_id, "platform_admin_added", dict(email=email))
+
+
+def set_platform_admin_active(db: Db, actor_id: int, user_id: int, active: bool) -> None:
+    _admin(db, actor_id)
+    if user_id == actor_id:
+        raise PortalError("You can't turn off your own account.")
+    r = db.query("SELECT email FROM users WHERE user_id = %s AND role = 'platform_admin'", (user_id,))
+    if not r:
+        raise PortalError("Not a platform admin.")
+    db.execute("UPDATE users SET active = %s WHERE user_id = %s AND role = 'platform_admin'", (bool(active), user_id))
+    _audit(db, None, actor_id, "platform_admin_enabled" if active else "platform_admin_disabled", dict(email=r[0]["email"]))
+
+
+def preview_farmers(db: Db, actor_id: int, tenant_id: str) -> list[dict]:
+    """The tenant's farmers that have a login: the people "view as farmer" can show the portal to."""
+    _admin(db, actor_id)
+    return db.query("SELECT u.* , f.name AS farmer_name FROM farmers f JOIN users u ON u.user_id = f.user_id "
+                    "WHERE f.tenant_id = %s AND f.active AND u.active AND u.role = 'farmer' ORDER BY f.name", (tenant_id,))
