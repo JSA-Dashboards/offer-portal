@@ -72,3 +72,32 @@ def db():
 
 def user(db, uid):
     return db.query("SELECT * FROM users WHERE user_id = %s", (uid,))[0]
+
+
+# ── AppTest helpers: the portal's pages are tab pages (only the open tab runs) ──────────────
+_SUBTABS = ("Tenants", "Usage report", "JSA admins")
+
+
+def pages(at):
+    """The main page tabs the signed-in user sees (not the offer-stage or platform sub-tabs)."""
+    return [t.label for t in at.tabs if " (" not in t.label and t.label not in _SUBTABS]
+
+
+def goto(at, page):
+    """Open a page: select its tab (the tab group's key holds the open tab's label) and rerun."""
+    key = next(k for k in at.session_state.filtered_state if k.startswith("main_tabs"))
+    at.session_state["_tab_" + key] = page
+    del at.session_state[key]
+    return at.run()
+
+
+def stage(at, name):
+    """Open an offers stage tab ('Hit', 'Closed', ...): tab labels carry live counts, so match on the name."""
+    assert any(t.label.startswith(name + " (") for t in at.tabs), name
+    at.session_state["offers_stage"] = name                 # the page remembers the open stage by name (the counts change)
+    del at.session_state["offers_tabs"]
+    return at.run()
+
+
+def stages(at):
+    return [t.label for t in at.tabs if " (" in t.label]

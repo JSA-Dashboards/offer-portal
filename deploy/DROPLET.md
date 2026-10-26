@@ -6,7 +6,7 @@ The Droplet runs only this job (no Streamlit), from a git clone at `/opt/offer-p
 
 ## State
 **Live since 2026-10-25.** Snowflake scripts 00-03 were run, the smoke test staged RCM (16) and Dorans (8) bids as
-`OFFER_PORTAL_SVC`, nothing was published, and the cron line is active (weekdays 06:15 and 12:15 CT). If the
+`OFFER_PORTAL_SVC`, nothing was published, and the cron line is active (weekdays 06:15, 12:15 and 16:15 CT). If the
 database is ever rebuilt, comment the line out first or every run fails and pages `cron-alert`.
 
 ## Setup record (already done)
@@ -20,9 +20,9 @@ database is ever rebuilt, comment the line out first or every run fails and page
    location name does not match a row in `locations`.
 5. Uncomment the crontab line (`crontab -e`; back it up first to `/opt/alerting/crontab.backup.<date>`):
 
-   `15 6,12 * * 1-5 /opt/alerting/cron-alert "Offer portal bid scrape" "/opt/offer-portal/logs/scrape_*.log" /opt/offer-portal/deploy/run_scrape.sh`
+   `15 6,12,16 * * 1-5 /opt/alerting/cron-alert "Offer portal bid scrape" "/opt/offer-portal/logs/scrape_*.log" /opt/offer-portal/deploy/run_scrape.sh`
 
-6. Optional heartbeat: create a healthchecks.io check `offer-portal-bid-scrape`, schedule `15 6,12 * * 1-5`
+6. Optional heartbeat: create a healthchecks.io check `offer-portal-bid-scrape`, schedule `15 6,12,16 * * 1-5`
    (America/Chicago, 2 h grace). An auto-made check defaults to a 1-day period and false-alarms on weekends.
 
 ## Other jobs (NOT installed yet: add after sql/06 is applied and the app is deployed)

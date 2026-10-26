@@ -1,18 +1,19 @@
+from conftest import goto, pages  # noqa: F401
 from portal import data, farmers
 from test_app import _as, app_db  # noqa: F401  (fixture + signed-in session helper)
 import conftest
 
 
 def _go(at, view):
-    at.radio[0].set_value(view).run()
+    goto(at, view)
     assert not at.exception, at.exception
     return at
 
 
 def test_staff_view_lists_the_new_screens(app_db):
     at = _as(app_db, 2)
-    assert {"Place offer", "Farmers"} <= set(at.radio[0].options)
-    assert not {"Place offer", "Farmers"} & set(_as(app_db, 1).radio[0].options)       # farmers don't get them
+    assert {"Place offer", "Farmers"} <= set(pages(at))
+    assert not {"Place offer", "Farmers"} & set(pages(_as(app_db, 1)))       # farmers don't get them
 
 
 def test_staff_adds_farmer_then_places_offer_for_them(app_db):
@@ -69,7 +70,7 @@ def test_farmer_sees_contract_ref_and_notes_but_cannot_edit_them(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (30, 'rcm', 'pat@x.com', 'farmer')")
     app_db.execute("UPDATE farmers SET user_id = 30 WHERE farmer_id = %s", (fid,))
     at = _as(app_db, 30)
-    at.radio[0].set_value("My offers").run()
+    goto(at, "My offers")
     assert not at.exception, at.exception
     assert any("Contract # C-77" in c.value and "hello" in c.value for c in at.caption)
     assert not at.expander                                                  # no edit controls for farmers

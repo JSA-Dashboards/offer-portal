@@ -1,3 +1,4 @@
+from conftest import goto, pages  # noqa: F401
 from portal import auth, data, farmers, purchases
 from test_app import _as, app_db  # noqa: F401  (fixture + signed-in session helper)
 import conftest
@@ -13,15 +14,15 @@ def _staff(db):
 
 
 def _go(at, view):
-    at.radio[0].set_value(view).run()
+    goto(at, view)
     assert not at.exception, at.exception
     return at
 
 
 def test_navigation_has_purchases_and_recap_for_staff_only(app_db):
     _staff(app_db)
-    assert {"Purchases", "Recap"} <= set(_as(app_db, 20).radio[0].options)
-    assert not {"Purchases", "Recap"} & set(_as(app_db, 1).radio[0].options)
+    assert {"Purchases", "Recap"} <= set(pages(_as(app_db, 20)))
+    assert not {"Purchases", "Recap"} & set(pages(_as(app_db, 1)))
 
 
 def test_staff_log_a_purchase_and_see_it_summarised(app_db):

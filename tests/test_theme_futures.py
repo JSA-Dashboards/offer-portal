@@ -1,3 +1,4 @@
+from conftest import goto, pages  # noqa: F401
 from datetime import datetime, timedelta, timezone
 
 from portal import data, futures, massive, theme
@@ -46,8 +47,8 @@ def test_disclaimer_shown_at_the_bottom_of_every_page(app_db):
     for uid in (1, 2):                                                                    # farmer and elevator admin
         at = _as(app_db, uid)
         assert DISCLAIMER_START in "".join(m.value for m in at.markdown)
-        for view in list(at.radio[0].options)[:4]:
-            at.radio[0].set_value(view).run()
+        for view in list(pages(at))[:4]:
+            goto(at, view)
             assert not at.exception, (view, at.exception)
             assert DISCLAIMER_START in "".join(m.value for m in at.markdown), view
 
@@ -233,7 +234,7 @@ def test_staff_see_the_live_flat_bid_delayed_futures_and_the_notice(app_db):
     _app_bid(app_db)
     futures.update_quotes(app_db, {"ZCZ26": _q(4.60)})
     at = _as(app_db, 2)
-    at.radio[0].set_value("Bid board").run()
+    goto(at, "Bid board")
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
     assert "Delayed futures." in text and "Delayed quotes." in text                    # banner + footer
@@ -268,7 +269,7 @@ def test_review_screen_edits_the_basis_and_posts_it_with_the_scraped_delivery_ra
                           futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21,
                           delivery_start="2999-12-01", delivery_end="2999-12-15")           # the source gave a clear range
     at = _as(app_db, 2)
-    at.radio[0].set_value("Review scraped bids").run()
+    goto(at, "Review scraped bids")
     assert not at.exception, at.exception
     text = "".join(m.value for m in at.markdown)
     assert "Posted now: basis -38¢" in text and "Delivery Dec 01 – Dec 15, 2999" in text
@@ -286,7 +287,7 @@ def test_review_screen_refuses_to_approve_a_suggestion_with_no_clear_delivery_ra
     data.stage_suggestion(app_db, "rcm", grain="Corn", delivery_month="2999-12", source="bushelsites", location_id=1,
                           futures_symbol="ZCZ26", basis_cents=-35, cash_price=4.21)          # e.g. a "Harvest 2026" label
     at = _as(app_db, 2)
-    at.radio[0].set_value("Review scraped bids").run()
+    goto(at, "Review scraped bids")
     assert "gave no clear delivery range" in "".join(m.value for m in at.markdown)
     next(b for b in at.button if b.label == "Approve").click().run()
     assert not at.exception, at.exception
@@ -297,7 +298,7 @@ def test_review_screen_refuses_to_approve_a_suggestion_with_no_clear_delivery_ra
 def test_platform_admin_can_switch_on_futures_for_farmers(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (5, NULL, 'p@jsa.com', 'platform_admin')")
     at = _as(app_db, 5)
-    at.radio[0].set_value("Platform").run()
+    goto(at, "Platform")
     assert not at.exception, at.exception
     next(t for t in at.toggle if t.label.startswith("Farmers can see delayed futures")).set_value(True)
     next(b for b in at.button if b.label == "Save settings").click().run()

@@ -1,3 +1,4 @@
+from conftest import goto, pages  # noqa: F401
 import sqlite3
 import pytest
 import streamlit as st
@@ -86,14 +87,14 @@ def test_staff_lands_on_offers_inbox_and_can_mark_hit(app_db):
 def test_staff_bid_board_has_post_controls(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2026-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
     at = _as(app_db, 2)
-    at.radio[0].set_value("Bid board").run()
+    goto(at, "Bid board")
     assert not at.exception
     assert at.dataframe and at.expander
 
 
 def test_farmer_makes_offer(app_db):
     at = _as(app_db, 1)
-    at.radio[0].set_value("Make an offer").run()
+    goto(at, "Make an offer")
     assert not at.exception, at.exception
     send = lambda: next(b for b in at.button if b.label == "Send offer")
     send().click().run()                                   # open price: no delivery period, no futures month yet
@@ -103,7 +104,7 @@ def test_farmer_makes_offer(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-30, cash_price=4.2)
     at = _as(app_db, 1)
-    at.radio[0].set_value("Make an offer").run()
+    goto(at, "Make an offer")
     at.session_state["offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]                       # pick the bid (AppTest cannot drive a
     at.run()                                                                                         # selectbox that has a format_func)
     assert not at.exception, at.exception
@@ -145,7 +146,7 @@ def test_join_page_rejects_bad_token(app_db):
 def test_staff_people_view_creates_invite_and_shows_link(app_db, monkeypatch):
     monkeypatch.setenv("OFFER_PORTAL_URL", "https://portal.example")
     at = _as(app_db, 2)
-    at.radio[0].set_value("People").run()
+    goto(at, "People")
     assert not at.exception
     at.text_input[0].set_value("fresh@x.com")
     next(b for b in at.button if b.label == "Create invite").click().run()
@@ -156,10 +157,10 @@ def test_staff_people_view_creates_invite_and_shows_link(app_db, monkeypatch):
 
 def test_platform_view_only_for_platform_admin(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (5, NULL, 'p@jsa.com', 'platform_admin')")
-    assert "Platform" not in _as(app_db, 2).radio[0].options
+    assert "Platform" not in pages(_as(app_db, 2))
     at = _as(app_db, 5)
-    assert "Platform" in at.radio[0].options
-    at.radio[0].set_value("Platform").run()
+    assert "Platform" in pages(at)
+    goto(at, "Platform")
     assert not at.exception
     assert any(sb.label == "Tenant" for sb in at.selectbox)
 
@@ -168,7 +169,7 @@ def test_platform_admin_creates_tenant_from_the_console(app_db, monkeypatch):
     monkeypatch.setenv("OFFER_PORTAL_URL", "https://portal.example")
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (5, NULL, 'p@jsa.com', 'platform_admin')")
     at = _as(app_db, 5)
-    at.radio[0].set_value("Platform").run()
+    goto(at, "Platform")
     f = {t.label: t for t in reversed(at.text_input)}          # the create form comes first on the page
     f["Company name"].set_value("Newco Grain")
     f["Slug (the ?t= in their link)"].set_value("newco")

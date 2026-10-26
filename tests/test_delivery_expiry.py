@@ -1,3 +1,4 @@
+from conftest import goto, pages  # noqa: F401
 from datetime import date, timedelta
 
 import pytest
@@ -200,14 +201,14 @@ def test_outstanding_offers_show_when_they_expire_and_the_bid_board_shows_the_wi
     data.create_offer(app_db, "rcm", user(app_db, 1), **HTA, bid_id=bid["bid_id"])
     at = _as(app_db, 2)
     assert any("Expires after Dec 20, 2999" in c.value for c in at.caption)
-    at.radio[0].set_value("Bid board").run()
+    goto(at, "Bid board")
     assert not at.exception, at.exception
     assert list(at.dataframe[0].value["Delivery window"]) == ["Dec 01 – Dec 20, 2999"]
 
 
 def test_the_offer_form_requires_a_delivery_period_when_there_is_no_bid(app_db):
     at = _as(app_db, 1)
-    at.radio[0].set_value("Make an offer").run()
+    goto(at, "Make an offer")
     next(b for b in at.button if b.label == "Send offer").click().run()
     assert at.error and "delivery period" in at.error[0].value.lower()
     assert data.list_offers(app_db, "rcm", user(app_db, 1)) == []

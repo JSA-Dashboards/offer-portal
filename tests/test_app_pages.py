@@ -1,3 +1,4 @@
+from conftest import goto, pages, stage, stages  # noqa: F401
 from portal import contracts, data, farmers
 from test_app import _as, app_db  # noqa: F401  (fixture + signed-in session helper)
 import conftest
@@ -6,11 +7,11 @@ FLAT = dict(grain="Corn", contract_type="CASH", price_type="FIXED", bushels=5000
 
 
 def _views(at):
-    return list(at.radio[0].options)
+    return list(pages(at))
 
 
 def _go(at, view):
-    at.radio[0].set_value(view).run()
+    goto(at, view)
     assert not at.exception, at.exception
     return at
 
@@ -36,10 +37,10 @@ def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app
     _hit_offer(app_db)
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT)
     at = _as(app_db, 2)
-    assert list(at.radio[1].options) == ["Outstanding (1)", "Hit (1)", "Acknowledged (0)", "Completed (0)", "Closed (0)"]
+    assert stages(at) == ["Outstanding (1)", "Hit (1)", "Acknowledged (0)", "Completed (0)", "Closed (0)"]
     assert any("5,000 bu Corn" in m.value for m in at.markdown)
     assert any(b.label == "Mark hit" for b in at.button)                                  # outstanding stage
-    at.radio[1].set_value("Hit").run()
+    stage(at, "Hit")
     assert not at.exception, at.exception
     assert any(b.label == "Acknowledge" for b in at.button)                              # hit stage: acknowledge first
     assert not any(b.label == "Complete and archive" for b in at.button)
@@ -48,12 +49,12 @@ def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app
 def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
     oid = _hit_offer(app_db)
     at = _as(app_db, 2)
-    at.radio[1].set_value("Hit").run()
+    stage(at, "Hit")
     assert any("implied futures 4.6800" in m.value for m in at.markdown)
     next(b for b in at.button if b.label == "Acknowledge").click().run()                # staff takes it on ...
     assert not at.exception, at.exception
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"
-    at.radio[1].set_value("Acknowledged").run()                                          # ... then must enter the contract number
+    stage(at, "Acknowledged")                                          # ... then must enter the contract number
     next(b for b in at.button if b.label == "Complete and archive").click().run()
     assert at.error and "contract number" in at.error[0].value.lower()
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"   # still not completed
@@ -62,7 +63,7 @@ def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
     assert not at.exception, at.exception
     o = data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]
     assert (o["offer_id"], o["status"], o["contract_ref"]) == (oid, "completed", "C-5531")
-    at.radio[1].set_value("Completed").run()
+    stage(at, "Completed")
     assert any("Contract # C-5531" in c.value for c in at.caption)
     assert not any(b.label == "Complete and archive" for b in at.button)                  # archived: read-only
 
@@ -154,8 +155,8 @@ def test_adding_a_rule_hits_offers_the_bid_already_reached(app_db):
     o = [x for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 2)) if x["offer_id"] == oid][0]
     assert (o["status"], o["auto_hit"]) == ("hit", 1)
     assert at.dataframe and list(at.dataframe[0].value["Bushels"]) == [5000]          # listed under "recently hit"
-    at.radio[0].set_value("Offers").run()
-    at.radio[1].set_value("Hit").run()
+    goto(at, "Offers")
+    stage(at, "Hit")
     assert any("Hit automatically" in c.value for c in at.caption)
 
 

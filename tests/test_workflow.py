@@ -1,3 +1,4 @@
+from conftest import goto, pages, stage, stages  # noqa: F401
 import pytest
 from portal import data, farmers
 from portal.data import PortalError
@@ -143,7 +144,7 @@ def test_acknowledged_offers_still_count_as_to_hedge_until_marked_hedged(db):
 def test_staff_acknowledge_then_cancel_from_the_offer_cards(app_db):
     oid = _hit(app_db)
     at = _as(app_db, 2)
-    at.radio[1].set_value("Hit").run()
+    stage(at, "Hit")
     assert not at.exception, at.exception
     assert any("Cancel this offer" == e.label for e in at.expander)
     next(t for t in at.text_input if t.label.startswith("Reason (required)")).set_value("Farmer sold elsewhere")
@@ -152,14 +153,14 @@ def test_staff_acknowledge_then_cancel_from_the_offer_cards(app_db):
     assert not at.error, [e.value for e in at.error]
     o = _st(app_db, oid)
     assert (o["status"], o["cancel_reason"]) == ("cancelled", "Farmer sold elsewhere")
-    at.radio[1].set_value("Closed").run()
+    stage(at, "Closed")
     assert any("Cancelled" in c.value and "Farmer sold elsewhere" in c.value and "hedge adjustment pending" in c.value for c in at.caption)
 
 
 def test_cancel_without_a_reason_is_refused_on_screen(app_db):
     _hit(app_db)
     at = _as(app_db, 2)
-    at.radio[1].set_value("Hit").run()
+    stage(at, "Hit")
     next(b for b in at.button if b.label == "Cancel offer").click().run()
     assert at.error and "reason" in at.error[0].value.lower()
 
@@ -168,7 +169,7 @@ def test_hedge_page_lists_cancelled_offers_until_the_admin_confirms(app_db):
     oid = _hit(app_db)
     data.cancel_offer(app_db, "rcm", 2, oid, "Farmer called to cancel")
     at = _as(app_db, 2)
-    at.radio[0].set_value("Hedge").run()
+    goto(at, "Hedge")
     assert not at.exception, at.exception
     assert any("Cancelled offers: adjust your hedges" in s.value for s in at.subheader)
     assert any("Farmer called to cancel" in m.value for m in at.markdown)

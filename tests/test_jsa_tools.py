@@ -1,3 +1,4 @@
+from conftest import pages  # noqa: F401
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -65,9 +66,9 @@ def test_jsa_console_lists_tenants_without_a_link(app_db):
 
 def test_view_as_each_level(app_db):
     at = _jsa(app_db)
-    assert not at.exception and "Platform" in list(at.radio[1].options) or "Platform" in [o for r in at.radio for o in r.options]
+    assert not at.exception and "Platform" in pages(at)
     lens = next(r for r in at.radio if r.label == "View as")
-    views = lambda a: next(r for r in a.radio if r.label == "View").options
+    views = pages
     lens.set_value("Elevator staff").run()
     assert not at.exception and "Hedge" not in views(at) and "Platform" not in views(at) and "Offers" in views(at)
     assert any("Previewing as elevator staff" in w.value for w in at.warning)
@@ -85,7 +86,7 @@ def test_view_as_a_farmer_shows_their_pages_and_blocks_writes(app_db):
     at = _jsa(app_db)
     next(r for r in at.radio if r.label == "View as").set_value("Farmer").run()
     assert not at.exception, at.exception
-    views = next(r for r in at.radio if r.label == "View").options
+    views = pages(at)
     assert list(views) == ["Bid board", "Make an offer", "My offers", "USDA calendar"]
     assert any("Previewing as farmer Login Farms" in w.value for w in at.warning)
     assert not any(t.label == "Email me notifications" for t in at.toggle)

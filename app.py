@@ -50,6 +50,19 @@ def _market_label(choice: str) -> str:
     return f"{g} · {contracts.futures_label(s)} ({s})"
 
 
+def _tab_pages(labels: list[str], key: str, default: str | None = None):
+    """Tab pages that only run the open tab: yields each label whose tab is selected, inside that tab.
+    (A plain st.tabs runs every tab on every click; with on_change="rerun" only the selected one is computed.)"""
+    seen = f"_tab_{key}"                                          # the open tab survives reruns and role switches
+    default = default or st.session_state.get(seen)
+    tabs = st.tabs(labels, key=key, on_change="rerun", default=default if default in labels else None)
+    for label, tab in zip(labels, tabs):
+        with tab:
+            if tab.open:
+                st.session_state[seen] = label
+                yield label
+
+
 def _months(n: int = 24) -> list[str]:
     t, out = date.today(), []
     y, m = t.year, t.month
@@ -310,12 +323,30 @@ def published_view(db, tenant_id: str, user: dict, editable: bool, tenant: dict 
 
 
 @st.fragment
+def _scrape_now(db, tenant_id: str) -> None:
+    """Admin button: pull this elevator's public bid pages now (the droplet also does it at 6:15, 12:15 and 4:15 pm CT, weekdays)."""
+    srcs = db.query("SELECT last_run_at, last_status FROM scrape_sources WHERE tenant_id = %s AND active", (tenant_id,))
+    if not srcs:
+        return
+    ran = [auth._as_utc(x["last_run_at"]) for x in srcs if x["last_run_at"]]
+    c1, c2 = st.columns([1, 3], vertical_alignment="center")
+    if c1.button("Scrape bids now", key="scrape_now", icon=":material/refresh:"):
+        with st.spinner("Fetching bids…"):
+            out = scrape_run.run(db, tenant_id)
+        failed = [v for v in out.values() if isinstance(v, str)]
+        st.session_state["bid_msg"] = (f"Scrape finished with a problem: {failed[0]}" if failed else
+                                       "Scrape finished. New and changed bids are below for your review.")
+        _refresh()
+    c2.caption(f"Last scraped: {max(ran).astimezone(data.CT):%a %b %d, %I:%M %p} CT" if ran else "Not scraped yet.")
+
+
 def suggestions_view(db, tenant_id: str, user: dict) -> None:
     if msg := st.session_state.pop("bid_msg", None):
         st.success(msg)
     st.caption("Basis levels pulled from your public cash-bid page. Nothing reaches farmers until you approve it: "
                "a posted basis is sticky. The flat bid then follows futures (futures + basis).")
     locs = _loc_names(db, tenant_id)
+    _scrape_now(db, tenant_id)
     sugg = data.list_suggestions(db, tenant_id)
     if not sugg:
         st.info("Nothing waiting for review.")
@@ -577,8 +608,14 @@ def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
                            help="Offers you entered on a farmer's behalf. Off shows the whole company's."):
         rows = [o for o in rows if o["placed_by"] == user["user_id"]]
     counts = {k: sum(1 for o in rows if o["status"] in v) for k, v in STAGES.items()}
-    stage = st.radio("Stage", list(STAGES), horizontal=True, label_visibility="collapsed",
-                     format_func=lambda k: f"{k} ({counts[k]})", key="offers_stage")
+    names = {f"{k} ({counts[k]})": k for k in STAGES}          # the counts change, so remember the stage by its name
+    remembered = st.session_state.get("offers_stage")
+    for label in _tab_pages(list(names), key="offers_tabs", default=next((l for l, k in names.items() if k == remembered), None)):
+        st.session_state["offers_stage"] = names[label]
+        _offers_stage(db, tenant_id, user, staff, rows, names[label])
+
+
+def _offers_stage(db, tenant_id: str, user: dict, staff: bool, rows: list[dict], stage: str) -> None:
     shown = [o for o in rows if o["status"] in STAGES[stage]]
     if stage == "Outstanding":
         shown.sort(key=lambda o: not o["bid_reached"])          # offers the bid has reached float to the top
@@ -765,7 +802,12 @@ def _tenant_editor(db, user: dict, t: dict) -> None:
 @st.fragment
 def platform_view(db, user: dict) -> None:
     uid = user["user_id"]
-    section = st.radio("Section", ["Tenants", "Usage report", "JSA admins"], horizontal=True, label_visibility="collapsed")
+    for section in _tab_pages(["Tenants", "Usage report", "JSA admins"], key="platform_tabs"):
+        _platform_section(db, user, section)
+
+
+def _platform_section(db, user: dict, section: str) -> None:
+    uid = user["user_id"]
     if section == "JSA admins":
         st.caption("JSA super admins can open every tenant and preview each role. They sign in with an emailed code.")
         for a in platform.list_platform_admins(db, uid):
@@ -1129,24 +1171,45 @@ def purchases_view(db, tenant: dict, user: dict) -> None:
     locs = _loc_names(db, tid)
     flist = farmers.list_farmers(db, tid, user["user_id"])
     with st.expander("Log a purchase", expanded=True):
+        # Pick where and when first: the approved bids for that location and period fill in the market and basis.
+        # (Each picker's key carries what it depends on, so a new choice upstream resets the ones below it.)
+        bids = data.list_bids(db, tid)
+        p1, p2, p3 = st.columns(3)
+        loc = p1.selectbox("Delivery location", [None] + list(locs), key="buy_loc", index=1 if locs else 0,
+                           format_func=lambda x: "—" if x is None else locs[x])
+        at_loc = [b for b in bids if loc is None or b["location_id"] == loc]
+        periods = sorted({b["delivery_month"] for b in at_loc})
+        period = p2.selectbox("Delivery period", periods or _months(), key=f"buy_period_{loc}")
+        match = [b for b in at_loc if b["delivery_month"] == period]
+        bid = None
+        if match:
+            by_id = {b["bid_id"]: b for b in match}
+            bid = by_id[p3.selectbox("Commodity and futures month", list(by_id), key=f"buy_bid_{loc}_{period}",
+                                     format_func=lambda i: f"{by_id[i]['grain']} · {contracts.futures_label(by_id[i]['futures_symbol'])} "
+                                                           f"({by_id[i]['futures_symbol']})")]
+            grain, fut = bid["grain"], bid["futures_symbol"]
+            posted = [f"basis {bid['basis_cents']:+d}¢" if bid["basis_cents"] is not None else None,
+                      f"flat ${bid['flat_price']:.4f}" if bid.get("flat_price") is not None else None]
+            st.caption("Posted bid (approved): " + ", ".join(x for x in posted if x) + ". The basis below is filled in "
+                       "from it; change it if the price you paid was different.")
+        else:
+            grain, fut = p3.selectbox("Commodity and futures month", _markets(), key=f"buy_mkt_{loc}_{period}",
+                                      format_func=_market_label).split("|")
+            st.caption("No approved bid is posted for this location and period, so enter the basis by hand.")
         with st.form("log_purchase", clear_on_submit=True):
             c1, c2 = st.columns(2)
             fpick = c1.selectbox("Bought from (farmer record)", [None] + flist,
                                  format_func=lambda f: "Type a name instead…" if f is None else _farmer_label(f))
             typed = c2.text_input("…or type the entity or person")
-            c3, c4, c5, c6 = st.columns(4)
-            market = c3.selectbox("Commodity and futures month", _markets(), format_func=_market_label)
+            c4, c5, c6, c10 = st.columns(4)
             bushels = c4.number_input("Bushels", min_value=0, step=1000, value=None, format="%d")
             price = c5.number_input("Flat price ($/bu)", value=None, step=0.01, format="%.4f")
-            basis = c6.number_input("Basis (¢)", value=None, step=1, format="%d")
-            c7, c8, c9, c10 = st.columns(4)
-            loc = c8.selectbox("Delivery location", [None] + list(locs), format_func=lambda x: "—" if x is None else locs[x])
-            period = c9.selectbox("Delivery period", [""] + _months(), format_func=lambda x: x or "—")
+            basis = c6.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d",
+                                    key=f"buy_basis_{bid['bid_id'] if bid else 'manual'}")
             ref = c10.text_input("Contract #")
             note = st.text_input("Note")
             if st.form_submit_button("Log purchase", type="primary"):
                 try:
-                    grain, fut = market.split("|")
                     purchases.add_purchase(
                         db, tid, user["user_id"], grain=grain, bushels=int(bushels or 0), counterparty=typed or None,
                         farmer_id=fpick["farmer_id"] if fpick else None, price=price,
@@ -1280,7 +1343,13 @@ def main() -> None:
         views = views + ["Platform"]
     if user.get("_preview"):
         st.warning(f"Previewing as {user['_preview']}. Nothing here is saved as them; switch back in the sidebar.")
-    view = st.radio("View", views, horizontal=True, label_visibility="collapsed")
+    for view in _tab_pages(views, key=f"main_tabs_{user['role']}"):
+        _render_page(db, tenant, user, view, staff, admin)
+    _end(tenant)
+
+
+def _render_page(db, tenant: dict, user: dict, view: str, staff: bool, admin: bool) -> None:
+    tid = tenant["tenant_id"]
     if view == "Platform":
         platform_view(db, user)
     elif view == "Summary":
@@ -1309,7 +1378,6 @@ def main() -> None:
         offer_form_view(db, tenant, user)
     else:
         offers_view(db, tid, user, staff)
-    _end(tenant)
 
 
 main()
