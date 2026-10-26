@@ -153,6 +153,9 @@ def console_view(db, real: dict) -> None:
 
 def login_view(db, tenant: dict | None) -> None:
     st.caption("Sign in with your email — we'll send you a one-time code.")
+    if not DEV and not auth.graph_configured():
+        st.warning("Email isn't set up on this deployment, so sign-in codes can't be sent. "
+                   "The four GRAPH_* settings must be in the app's secrets above any [section] heading.")
     step = st.session_state.get("login_step", "email")
     if step == "email":
         with st.form("email_form"):
