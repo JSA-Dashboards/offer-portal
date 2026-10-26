@@ -1,4 +1,4 @@
-# Offer portal
+# JSA Offer Portal Management
 
 White-label grain offer manager. JSA runs the platform; each elevator company is a **tenant** that
 manages its own bids, farmers and offers. One Streamlit app serves every tenant (`?t=<slug>`).

@@ -60,7 +60,7 @@ def test_root_page_without_a_link_offers_jsa_sign_in(app_db):
 
 def test_jsa_console_lists_tenants_without_a_link(app_db):
     at = _jsa(app_db, tenant=None)
-    assert not at.exception and any("JSA console" in s.value for s in at.subheader)
+    assert not at.exception and any("JSA Offer Portal Management" in s.value for s in at.subheader)
 
 
 def test_view_as_each_level(app_db):

@@ -1,4 +1,4 @@
-"""Offer Portal — white-label grain offer manager. One app; the tenant comes from ?t=<slug>.
+"""JSA Offer Portal Management — white-label grain offer manager. One app; the tenant comes from ?t=<slug>.
 
 Access by role (same portal, more or less in it): JSA platform admin (everything, every tenant) >
 elevator admin (bids, scraped bids, hedging, auto-hit, people, everything staff do) >
@@ -31,8 +31,8 @@ GRAINS = contracts.GRAINS
 DEV = os.environ.get("OFFER_PORTAL_DEV") == "1"
 
 _ICON = pathlib.Path(__file__).parent / "assets" / "jsa_favicon.png"
-st.set_page_config(page_title="Offer portal", page_icon=str(_ICON) if _ICON.exists() else ":material/grain:",
-                   layout="wide")
+st.set_page_config(page_title="JSA Offer Portal Management", page_icon=str(_ICON) if _ICON.exists() else ":material/grain:",
+                   layout="wide", initial_sidebar_state="expanded")
 
 
 @st.cache_resource
@@ -85,7 +85,7 @@ def _may_see_futures(tenant: dict | None, user: dict) -> bool:
 
 
 def _send_code(tenant: dict | None):
-    name = tenant["name"] if tenant else "JSA Offer Portal"
+    name = tenant["name"] if tenant else "JSA Offer Portal Management"
 
     def send(email: str, code: str) -> None:
         if auth.graph_configured():
@@ -136,12 +136,14 @@ def jsa_sidebar(db, real: dict, tenant: dict) -> dict:
 
 def console_view(db, real: dict) -> None:
     """JSA super admin signed in without a tenant link: pick a tenant, or run the platform pages."""
-    st.subheader("JSA console")
+    st.subheader("JSA Offer Portal Management")
     tenants = platform.list_tenants(db, real["user_id"])
     for t in tenants:
         c1, c2 = st.columns([4, 1])
         c1.markdown(f"**{t['name']}** · `{t['tenant_id']}` · {t['users']} users · {t['status']}")
-        c2.link_button("Open", f"?t={t['tenant_id']}")
+        if c2.button("Open", key=f"open_{t['tenant_id']}"):          # same tab: a link would start a new, signed-out session
+            st.query_params["t"] = t["tenant_id"]
+            st.rerun()
     platform_view(db, real)
     with st.sidebar:
         st.caption(f"{real['email']} · platform admin")

@@ -121,7 +121,7 @@ def header_html(tenant: dict | None = None, subtitle: str | None = None) -> str:
     """The page header. LEFT = white-label slot (tenant logo + name). RIGHT = JSA 'Powered by'."""
     t = tenant or {}
     logo = _https(t.get("logo_url"))
-    name = html.escape(t.get("name") or "Offer portal")
+    name = html.escape(t.get("name") or "JSA Offer Portal Management")
     sub = html.escape(subtitle or ("Grain offers and bids" if t.get("name") else
                                    "Grain offers and bids · John Stewart & Associates"))
     left_logo = f'<img src="{html.escape(logo)}" alt="{name}">' if logo else ""
@@ -171,7 +171,7 @@ def email_html(tenant: dict | None, body_html: str) -> str:
     """A simple, client-safe HTML email: tenant header, the message, the standard JSA disclaimer (as on every page).
     `body_html` must already be escaped / trusted."""
     t = tenant or {}
-    name = html.escape(t.get("name") or "Offer portal")
+    name = html.escape(t.get("name") or "JSA Offer Portal Management")
     logo = _https(t.get("logo_url"))
     head_logo = f'<img src="{html.escape(logo)}" alt="" style="height:34px;vertical-align:middle;margin-right:10px">' if logo else ""
     powered = ('<div style="margin-top:6px;font-size:11px;color:#8a9199">Powered by John Stewart &amp; Associates</div>'
