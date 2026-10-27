@@ -94,7 +94,7 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
     parts.append(_h("Offers still working"))
     work_rows = sorted(working, key=lambda o: (o["grain"], o["delivery_period"], o["farmer_name"] or ""))
     parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in work_rows], "No outstanding offers."))
-    parts.append(_h("Purchases made today" + ("" if admin else " (yours)")))
+    parts.append(_h("Purchases made today" + ("" if admin else " (yours)") + " (includes offers acknowledged today)"))
     if not buy_groups:
         parts.append("<p style='color:#8a9199;font-size:13px'>No purchases were logged today.</p>")
     for g in buy_groups:
@@ -102,14 +102,16 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
                                       f"avg basis {g['avg_basis_cents']:+.1f}¢" if g["avg_basis_cents"] is not None else "") if x)
         parts.append(f"<p style='margin:10px 0 4px'><b>{_e(g['grain'])}</b>: {g['bushels']:,} bu in {g['entries']} "
                      f"purchase{'s' if g['entries'] != 1 else ''}{' · ' + avg if avg else ''}</p>")
-        head = ["Bought from", "Bushels", "Price", "Basis", "Futures month", "Delivery location", "Delivery period", "Contract #"]
+        head = ["Bought from", "Bushels", "Price", "Basis", "Futures month", "Delivery location", "Delivery period", "Contract #",
+                "Source"]
         if admin:
             head.append("Logged by")
         rows = []
         for p in g["rows"]:
             r = [p["counterparty"], f"{p['bushels']:,}", f"${p['price']:.4f}" if p["price"] is not None else "",
                  f"{p['basis_cents']:+d}¢" if p["basis_cents"] is not None else "", p["futures_symbol"] or "",
-                 p["delivery_location"] or "", p["delivery_period"] or "", p["contract_ref"] or ""]
+                 p["delivery_location"] or "", p["delivery_period"] or "", p["contract_ref"] or "",
+                 "Offer" if p.get("offer_id") else "Entered"]
             if admin:
                 r.append(p.get("staff_name") or p.get("staff_email") or "")
             rows.append(r)

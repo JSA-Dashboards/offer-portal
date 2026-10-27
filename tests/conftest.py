@@ -18,7 +18,8 @@ CREATE TABLE sms_queue (sms_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, t
   provider_id TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, sent_at TEXT);
 CREATE TABLE purchases (purchase_id INTEGER PRIMARY KEY, tenant_id TEXT, purchase_date TEXT, staff_user_id INT, farmer_id INT,
   counterparty TEXT, grain TEXT, bushels INT, price REAL, basis_cents INT, futures_symbol TEXT, location_id INT,
-  delivery_location TEXT, delivery_period TEXT, contract_ref TEXT, note TEXT, voided_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+  delivery_location TEXT, delivery_period TEXT, contract_ref TEXT, note TEXT, voided_at TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+  offer_id INT);
 CREATE TABLE scrape_sources (source_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT, url TEXT,
   location_name TEXT, active INT DEFAULT 1, last_run_at TEXT, last_status TEXT);
 CREATE TABLE farmers (farmer_id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, client_id TEXT, entity_name TEXT,

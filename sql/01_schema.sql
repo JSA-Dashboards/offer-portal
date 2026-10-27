@@ -296,6 +296,7 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 -- ── What staff bought today, outside or inside the offer system (feeds the end-of-day recap) ────────────────────────
 CREATE TABLE IF NOT EXISTS purchases (
+    offer_id       NUMBER(38,0),                   -- set when an acknowledged offer created this purchase (one per offer)
     purchase_id    NUMBER(38,0) NOT NULL,
     tenant_id      STRING       NOT NULL,
     purchase_date  DATE         NOT NULL,           -- Central-time day the buy was logged for

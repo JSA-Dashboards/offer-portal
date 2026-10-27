@@ -620,7 +620,8 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
             line.append("hedge not yet acknowledged")
         st.markdown(_md(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]"))
         if staff and o.get("bid_reached"):
-            st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
+            st.markdown(":green-background[:material/bolt: Price reached: the posted bid is at this offer. "
+                        "Accept Offer to take it. It then moves to Hit.]")
         meta = [x for x in ((f"Delivery {o['delivery_start']}" + (f" → {o['delivery_end']}" if o["delivery_end"] else "")) if o["delivery_start"] else "",
                             (f"Good through {data.offer_delivery_end(o):%b %d, %Y}"
                              if o["status"] == "submitted" and data.offer_delivery_end(o) else ""),
@@ -654,9 +655,9 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                             st.error(str(e))
         key = str(o["offer_id"])
         if o["status"] == "submitted":
-            # The elevator marks an offer hit (or declines it). A farmer can withdraw their own; staff can
+            # The elevator accepts an offer (it becomes Hit) or declines it. A farmer can withdraw their own; staff can
             # record a withdrawal for a farmer who called in (flagged on_behalf in the offer history).
-            acts = ([("Mark hit", "hit", "primary"), ("Decline", "decline", "secondary"),
+            acts = ([("Accept Offer", "hit", "primary"), ("Decline", "decline", "secondary"),
                      ("Withdraw for farmer", "withdraw", "secondary")] if staff
                     else [("Withdraw", "withdraw", "secondary")])
             with st.container(horizontal=True):
@@ -672,7 +673,8 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                         except data.PortalError as e:
                             st.error(str(e))
         elif o["status"] == "hit" and staff:
-            if st.button("Acknowledge", key=f"ack_{key}", type="primary"):
+            if st.button("Confirm Purchase", key=f"ack_{key}", type="primary",
+                         help="The elevator takes this grain on. It is added to today's purchases and the recap."):
                 try:
                     data.acknowledge_offer(db, tenant_id, user["user_id"], o["offer_id"])
                     _refresh()
@@ -792,10 +794,10 @@ def _offers_stage(db, tenant_id: str, user: dict, staff: bool, rows: list[dict],
     if stage == "Outstanding":
         shown.sort(key=lambda o: not o["bid_reached"])          # offers the bid has reached float to the top
     elif stage == "Hit" and staff:
-        st.caption("These offers have been hit. Acknowledge each one to take it on; then enter its contract number "
-                   "to complete it.")
+        st.caption("These offers have been accepted. Confirm Purchase on each one to take it on: it is added to today's "
+                   "purchases and the daily summary. Then enter its contract number to complete it.")
     elif stage == "Acknowledged" and staff:
-        st.caption("Acknowledged offers. Enter the contract number to complete one and move it to the archive.")
+        st.caption("Confirmed purchases. Enter the contract number to complete one and move it to the archive.")
     elif stage == "Completed":
         st.caption("Archive: completed offers, each with its contract number.")
     if not shown:
@@ -1474,6 +1476,8 @@ def purchases_view(db, tenant: dict, user: dict) -> None:
     groups = purchases.summarize(rows)
     st.markdown(f"<div class='sec-header'>Purchases for {day:%A, %B %d}"
                 f"{'' if admin else ' (yours)'}</div>", unsafe_allow_html=True)
+    st.caption("Offers you acknowledge are added here automatically (Source: Offer), in your name, on the day you "
+               "acknowledge them. Cancelling an offer after its hit voids its purchase.")
     if not groups:
         st.info("No purchases logged for this day.")
     for g in groups:
@@ -1487,6 +1491,7 @@ def purchases_view(db, tenant: dict, user: dict) -> None:
                        "Basis (¢)": p["basis_cents"], "Futures month": p["futures_symbol"] or "",
                        "Delivery location": p["delivery_location"] or "", "Delivery period": p["delivery_period"] or "",
                        "Contract #": p["contract_ref"] or "",
+                       "Source": f"Offer #{str(p['offer_id'])[-5:]}" if p.get("offer_id") else "Entered",
                        **({"Logged by": p.get("staff_name") or p.get("staff_email") or ""} if admin else {})}
                       for p in g["rows"]], hide_index=True, width="stretch",
                      column_config={"Bushels": st.column_config.NumberColumn(format="%d"),

@@ -7,7 +7,7 @@ caller wraps `offer_event` in a try/except.
 
 Who hears about what:
   offer_submitted  staff + admins (not the person who entered it)      "New offer"
-  offer_hit        the farmer, staff, admins                           "acknowledge it, then enter the contract #"
+  offer_hit        the farmer, staff, admins                           "confirm the purchase, then enter the contract #"
   offer_completed  the farmer                                          contract number
   offer_declined / offer_expired   the farmer
   offer_withdrawn  staff + admins (when the FARMER withdrew)
@@ -143,7 +143,7 @@ def offer_event(db: Db, tenant_id: str, kind: str, offer_id: int, **ctx) -> int:
     elif kind == "offer_hit":
         how = "automatically by your auto-hit rules" if ctx.get("auto") else "by staff"
         plan.append((staff, f"HIT: {o['bushels']:,} bu {o['grain']} ({o.get('farmer_name') or 'farmer'})",
-                     _msg(tenant, f"An offer was hit {how}. <b>Acknowledge it in the portal, then enter its contract number.</b>", o)))
+                     _msg(tenant, f"An offer was hit {how}. <b>Confirm the purchase in the portal, then enter its contract number.</b>", o)))
         if farmer:
             plan.append(([farmer], f"Your offer was hit: {o['bushels']:,} bu {o['grain']}",
                          _msg(tenant, "Good news: your offer was hit. The elevator will confirm your contract shortly.", o)))
@@ -248,7 +248,7 @@ def _sms_text(name: str, kind: str, o: dict) -> str:
         px = f"${o['price']:.2f}" if o["price_type"] == "FIXED" else f"{o['basis_cents']:+d}c {o['futures_symbol']}"
         return f"{name}: new offer, {farmer}, {bu} at {px}."
     if kind == "offer_hit":
-        return f"{name}: HIT, {farmer}, {bu}. Acknowledge it in the portal."
+        return f"{name}: HIT, {farmer}, {bu}. Confirm the purchase in the portal."
     return ""
 
 

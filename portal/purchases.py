@@ -23,7 +23,8 @@ def _is_admin(role: str) -> bool:
 def add_purchase(db: Db, tenant_id: str, staff_id: int, *, grain: str, bushels: int, counterparty: str | None = None,
                  farmer_id: int | None = None, price: float | None = None, basis_cents: int | None = None,
                  futures_symbol: str | None = None, location_id: int | None = None, delivery_period: str | None = None,
-                 contract_ref: str | None = None, note: str | None = None, purchase_date: date | None = None) -> int:
+                 contract_ref: str | None = None, note: str | None = None, purchase_date: date | None = None,
+                 offer_id: int | None = None) -> int:
     _require_staff(db, tenant_id, staff_id)
     if grain not in CONTRACT_BUSHELS:
         raise PortalError("Choose a commodity.")
@@ -68,11 +69,14 @@ def add_purchase(db: Db, tenant_id: str, staff_id: int, *, grain: str, bushels: 
     if ref and len(ref) > 60:
         raise PortalError("Contract reference is limited to 60 characters.")
     pid = new_id()
-    _insert(db, "purchases", dict(purchase_id=pid, tenant_id=tenant_id, purchase_date=day.isoformat(), staff_user_id=staff_id,
-                                  farmer_id=farmer_id, counterparty=name, grain=grain, bushels=int(bushels), price=price,
-                                  basis_cents=basis_cents, futures_symbol=sym, location_id=location_id,
-                                  delivery_location=loc_name, delivery_period=period, contract_ref=ref,
-                                  note=(note or "").strip()[:300] or None))
+    row = dict(purchase_id=pid, tenant_id=tenant_id, purchase_date=day.isoformat(), staff_user_id=staff_id,
+               farmer_id=farmer_id, counterparty=name, grain=grain, bushels=int(bushels), price=price,
+               basis_cents=basis_cents, futures_symbol=sym, location_id=location_id,
+               delivery_location=loc_name, delivery_period=period, contract_ref=ref,
+               note=(note or "").strip()[:300] or None)
+    if offer_id is not None:
+        row["offer_id"] = offer_id
+    _insert(db, "purchases", row)
     _audit(db, tenant_id, staff_id, "purchase_logged", dict(purchase_id=pid, grain=grain, bushels=int(bushels)))
     return pid
 
@@ -131,3 +135,75 @@ def summarize(rows: list[dict]) -> list[dict]:
                         avg_basis_cents=round(g["bs_sum"] / g["bs_bu"], 1) if g["bs_bu"] else None,
                         rows=sorted(g["rows"], key=lambda p: (p["delivery_period"] or "", p["counterparty"]))))
     return out
+
+
+# ── purchases that come from offers ─────────────────────────────────────────────
+# When staff ACKNOWLEDGE a hit offer the elevator has bought that grain: it is added to that day's purchases (so the
+# recap carries it) in the name of the person who acknowledged it. One purchase per offer; the contract number follows
+# when the offer is completed; cancelling the offer voids the purchase.
+def linked_ready(db: Db) -> bool:
+    """True once sql/13 has added purchases.offer_id. Until then offers simply don't create purchases."""
+    import time
+    now = time.monotonic()
+    state = getattr(db, "_purchase_link_ready", None)
+    if state and (state[0] or now - state[1] < 60):
+        return state[0]
+    try:
+        db.query("SELECT offer_id FROM purchases LIMIT 1")
+        ok = True
+    except Exception:
+        ok = False
+    db._purchase_link_ready = (ok, now)
+    return ok
+
+
+def record_from_offer(db: Db, tenant_id: str, offer_id: int, staff_id: int) -> int | None:
+    """The purchase for an acknowledged offer (None if it already has one, or sql/13 hasn't run). Priced as the offer is:
+    a flat-price offer logs its price (and the basis it was struck against); a basis (HTA) offer logs its basis."""
+    import json
+    from .data import delivery_period
+    if not linked_ready(db):
+        return None
+    if db.query("SELECT 1 AS x FROM purchases WHERE tenant_id = %s AND offer_id = %s", (tenant_id, offer_id)):
+        return None                                           # one per offer, even if someone voided it since
+    r = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
+    if not r:
+        return None
+    o = r[0]
+    snap = o.get("bid_snapshot")
+    if isinstance(snap, str):
+        try:
+            snap = json.loads(snap)
+        except ValueError:
+            snap = None
+    loc = o.get("location_id") if o.get("location_id") is not None else (snap or {}).get("location_id")
+    period = delivery_period(o)
+    fixed = o["price_type"] == "FIXED"
+    kind = {"CASH": "cash", "HTA": "HTA", "FUTURES_ONLY": "futures-only"}.get(o["contract_type"], o["contract_type"])
+    return add_purchase(
+        db, tenant_id, staff_id, grain=o["grain"], bushels=o["bushels"], farmer_id=o["farmer_id"],
+        price=o["price"] if fixed else None,
+        basis_cents=o["basis_ref_cents"] if fixed else o["basis_cents"], futures_symbol=o["futures_symbol"],
+        location_id=loc, delivery_period=None if period == "Unscheduled" else period,
+        contract_ref=o.get("contract_ref"), note=f"From offer #{offer_id} ({kind}, purchase confirmed)", offer_id=offer_id)
+
+
+def set_contract_for_offer(db: Db, tenant_id: str, offer_id: int, contract_ref: str) -> None:
+    """The offer was completed: its purchase carries the contract number."""
+    if linked_ready(db):
+        db.execute("UPDATE purchases SET contract_ref = %s WHERE tenant_id = %s AND offer_id = %s AND voided_at IS NULL",
+                   (contract_ref, tenant_id, offer_id))
+
+
+def void_for_offer(db: Db, tenant_id: str, offer_id: int, actor_id: int) -> int:
+    """The offer was cancelled after its hit: its purchase no longer stands. Returns how many were voided."""
+    if not linked_ready(db):
+        return 0
+    rows = db.query("SELECT purchase_id FROM purchases WHERE tenant_id = %s AND offer_id = %s AND voided_at IS NULL",
+                    (tenant_id, offer_id))
+    for r in rows:
+        db.execute("UPDATE purchases SET voided_at = CURRENT_TIMESTAMP() WHERE purchase_id = %s AND tenant_id = %s",
+                   (r["purchase_id"], tenant_id))
+        _audit(db, tenant_id, actor_id, "purchase_voided", dict(purchase_id=r["purchase_id"], offer_id=offer_id,
+                                                                reason="offer cancelled"))
+    return len(rows)

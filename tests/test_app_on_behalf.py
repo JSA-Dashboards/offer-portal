@@ -84,9 +84,9 @@ def test_staff_accepts_and_withdraws_for_a_phone_farmer(app_db):
     at = _as(app_db, 2)
     assert any("entered by" in m.value and "555-0000" in m.value for m in at.markdown)
     labels = {b.label for b in at.button}
-    assert {"Mark hit", "Decline", "Withdraw for farmer"} <= labels
+    assert {"Accept Offer", "Decline", "Withdraw for farmer"} <= labels
     assert not any("ounter" in b.label for b in at.button)                  # no counter-offers anywhere
-    next(b for b in at.button if b.label == "Mark hit").click().run()
+    next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception, at.exception
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
     o2 = data.place_offer_for_farmer(app_db, "rcm", 2, fid, **terms)

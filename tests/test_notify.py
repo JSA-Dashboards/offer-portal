@@ -78,7 +78,7 @@ def test_a_hit_tells_the_farmer_staff_and_admins_to_acknowledge(db):
     data.act_on_offer(db, "rcm", user(db, 2), oid, "hit")
     assert _to(db, "offer_hit") == ["admin@rcm.example", "farmer@a.example", "sam@rcm.example", "sue@rcm.example"]
     staff_mail = [r for r in _box(db, "offer_hit") if r["to_email"] == "sam@rcm.example"][0]
-    assert staff_mail["subject"].startswith("HIT: 10,000 bu Corn") and "Acknowledge it in the portal" in staff_mail["body_html"]
+    assert staff_mail["subject"].startswith("HIT: 10,000 bu Corn") and "Confirm the purchase in the portal" in staff_mail["body_html"]
     farmer_mail = [r for r in _box(db, "offer_hit") if r["to_email"] == "farmer@a.example"][0]
     assert "Your offer was hit" in farmer_mail["subject"] and "Acknowledge" not in farmer_mail["body_html"]
     assert "substantial risk of loss" in farmer_mail["body_html"]                          # the standard disclaimer is in every email

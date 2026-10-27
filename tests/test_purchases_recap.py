@@ -131,7 +131,8 @@ def test_an_admin_recap_has_everything_the_hedge_and_pending_adjustments(db):
     assert "Sam Bought From" in h and "Sue Bought From" in h and "Logged by" in h and "all company activity" in h
     assert "Hedge position (admin)" in h and "ZCZ26" in h and "waiting for a contract number" in h
     assert "1</b> cancelled offer still need a hedge adjustment" in h
-    assert r["counts"]["purchases"] == 2 and r["counts"]["hit_today"] == 2
+    assert r["counts"]["purchases"] == 2 + 1 and r["counts"]["hit_today"] == 2       # the acknowledged offer is a purchase too
+    assert "includes offers acknowledged today" in h and ">Offer<" in h
 
 
 def test_hits_are_dated_in_central_time_and_only_today_counts(db):
@@ -168,3 +169,79 @@ def test_daily_recaps_go_to_staff_and_admins_once_a_day(db):
     sent = []
     assert notify.send_pending(db, send=lambda t, s, h: sent.append(t))["sent"] == 3 + 3 + 2 + 2
     assert "admin@rcm.example" in sent
+
+
+# ── acknowledged offers become the day's purchases ───────────────────────────
+def _offer_hit(db, **terms):
+    f = farmers.create_farmer(db, "rcm", 20, "Pat Phone", "555-1212")
+    o = data.place_offer_for_farmer(db, "rcm", 20, f, **{**HTA, **terms})
+    data.act_on_offer(db, "rcm", user(db, 2), o, "hit")
+    return o
+
+
+def _todays(db, uid=2):
+    return purchases.list_purchases(db, "rcm", user(db, uid))
+
+
+def test_a_hit_offer_is_not_a_purchase_until_staff_acknowledge_it(db):
+    _setup(db)
+    o = _offer_hit(db)
+    assert _todays(db) == []
+    data.acknowledge_offer(db, "rcm", 20, o)
+    (p,) = _todays(db)
+    assert (p["offer_id"], p["staff_user_id"], p["counterparty"], p["grain"], p["bushels"], p["futures_symbol"]) == \
+           (o, 20, "Pat Phone", "Corn", HTA["bushels"], "ZCZ26")
+    assert p["basis_cents"] == HTA["basis_cents"] and p["price"] is None            # an HTA offer logs its basis
+    assert "From offer" in p["note"]
+    assert [x["offer_id"] for x in _todays(db, 20)] == [o]                           # the staffer who acknowledged it sees it
+    assert _todays(db, 21) == []                                                     # another staffer does not
+
+
+def test_acknowledging_twice_or_completing_never_makes_a_second_purchase_and_the_contract_number_follows(db):
+    _setup(db)
+    o = _offer_hit(db)
+    data.acknowledge_offer(db, "rcm", 20, o)
+    with pytest.raises(PortalError):
+        data.acknowledge_offer(db, "rcm", 20, o)
+    data.complete_offer(db, "rcm", 20, o, "C-7788")
+    (p,) = _todays(db)
+    assert p["contract_ref"] == "C-7788"
+    # a manual entry for the same grain is separate, and the recap lists both with their source
+    _buy(db, 20, counterparty="Walk-in Farms")
+    h = recap.build_recap(db, "rcm", dict(user_id=2, role="elevator_admin"))["html"]
+    assert "Pat Phone" in h and "Walk-in Farms" in h and ">Offer<" in h and ">Entered<" in h
+
+
+def test_a_flat_price_offer_logs_its_price_and_the_basis_it_was_struck_against(db):
+    _setup(db)
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", basis_cents=-38, futures_symbol="ZCZ26", location_id=1)
+    bid = data.list_bids(db, "rcm")[0]["bid_id"]
+    f = farmers.create_farmer(db, "rcm", 20, "Pat Phone", "555-1212")
+    o = data.place_offer_for_farmer(db, "rcm", 20, f, grain="Corn", contract_type="CASH", price_type="FIXED", bushels=5000,
+                                    price=4.30, futures_symbol="ZCZ26", bid_id=bid)
+    data.act_on_offer(db, "rcm", user(db, 2), o, "hit")
+    data.acknowledge_offer(db, "rcm", 20, o)
+    (p,) = _todays(db)
+    assert p["price"] == 4.30 and p["basis_cents"] == -38 and p["delivery_period"] == "2999-12" and p["delivery_location"]
+
+
+def test_cancelling_an_offer_after_its_hit_voids_its_purchase(db):
+    _setup(db)
+    o = _offer_hit(db)
+    data.acknowledge_offer(db, "rcm", 20, o)
+    assert len(_todays(db)) == 1
+    data.cancel_offer(db, "rcm", 20, o, "farmer changed mind")
+    assert _todays(db) == []
+    assert db.query("SELECT voided_at FROM purchases WHERE offer_id = %s", (o,))[0]["voided_at"] is not None
+    assert [r["action"] for r in db.query("SELECT action FROM audit_log WHERE action = 'purchase_voided'")] == ["purchase_voided"]
+
+
+def test_without_sql_13_acknowledging_still_works_and_just_skips_the_purchase(db, monkeypatch):
+    _setup(db)
+    real = db.query
+    monkeypatch.setattr(db, "query", lambda sql, params=(): (_ for _ in ()).throw(RuntimeError("no such column"))
+                        if "SELECT offer_id FROM purchases" in sql else real(sql, params))
+    o = _offer_hit(db)
+    data.acknowledge_offer(db, "rcm", 20, o)
+    assert [x["status"] for x in db.query("SELECT status FROM offers WHERE offer_id = %s", (o,))] == ["acknowledged"]
+    assert _todays(db) == []

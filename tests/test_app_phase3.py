@@ -115,7 +115,7 @@ def test_an_action_in_the_app_sends_the_queued_emails_right_away(app_db, monkeyp
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **HTA)                      # queues "new offer" emails
     assert sent == []                                                                       # not sent yet (queued only)
     at = _as(app_db, 20)
-    next(b for b in at.button if b.label == "Mark hit").click().run()
+    next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception, at.exception
     got = sorted(to for to, _ in sent)
     assert got == sorted(["admin@rcm.example", "sam@rcm.example", "sue@rcm.example",         # new-offer emails

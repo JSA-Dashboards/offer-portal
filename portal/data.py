@@ -475,7 +475,7 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
 
 
 def bid_reached(offer: dict, bid: dict | None) -> bool:
-    """Has the live bid come up to this outstanding offer? (A prompt for staff to mark it hit.)"""
+    """Has the live bid come up to this outstanding offer? (A prompt for staff to accept it.)"""
     if bid is None or offer["status"] != "submitted":
         return False
     if offer["price_type"] == "FIXED":
@@ -705,7 +705,7 @@ def _hit_context(bid: dict | None) -> dict:
 
 def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, rule: dict | None = None,
               bid: dict | None = None) -> None:
-    """The one place an offer becomes hit: staff clicking Mark hit, or an auto-hit rule (rule given,
+    """The one place an offer becomes hit: staff clicking Accept Offer, or an auto-hit rule (rule given,
     actor None). Writes the status, the history event, the confirmation, and the billing usage. Either way the
     live price context at the moment of the hit is saved with the event and the confirmation."""
     auto = rule is not None
@@ -894,6 +894,22 @@ def _require_admin(db: Db, tenant_id: str, actor_id: int) -> None:
         raise PortalError("Elevator admin only.")
 
 
+def _offer_purchase(db: Db, action: str, tenant_id: str, offer_id: int, actor_id: int, ref: str | None = None) -> None:
+    """Keep the day's purchases in step with an offer (see purchases.record_from_offer). Best effort: a problem here is
+    logged and never undoes the acknowledgement, completion or cancellation that triggered it."""
+    import logging
+    from . import purchases
+    try:
+        if action == "record":
+            purchases.record_from_offer(db, tenant_id, offer_id, actor_id)
+        elif action == "contract":
+            purchases.set_contract_for_offer(db, tenant_id, offer_id, ref)
+        elif action == "void":
+            purchases.void_for_offer(db, tenant_id, offer_id, actor_id)
+    except Exception:
+        logging.getLogger("offer_portal").exception("purchase for offer %s (%s) could not be updated", offer_id, action)
+
+
 def acknowledge_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int) -> None:
     """A staff member takes a hit offer on (who and when are recorded). Next step: its contract number."""
     _require_staff(db, tenant_id, staff_id)
@@ -906,6 +922,7 @@ def acknowledge_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int) -> N
                "updated_at = CURRENT_TIMESTAMP() WHERE offer_id = %s AND tenant_id = %s", (staff_id, offer_id, tenant_id))
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=staff_id,
                                      event_type="acknowledged", detail={}), ("detail",))
+    _offer_purchase(db, "record", tenant_id, offer_id, staff_id)     # the elevator has bought it: today's purchases
     _notify(db, tenant_id, "offer_acknowledged", offer_id)
 
 
@@ -919,7 +936,7 @@ def complete_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int, contrac
     if not r:
         raise PortalError("Offer not found for this tenant.")
     if r[0]["status"] == "hit":
-        raise PortalError("Acknowledge this offer first, then enter its contract number to complete it.")
+        raise PortalError("Confirm the purchase first, then enter its contract number to complete it.")
     if r[0]["status"] != "acknowledged":
         raise PortalError("Only an acknowledged offer can be completed.")
     db.execute("UPDATE offers SET status = 'completed', contract_ref = %s, completed_at = CURRENT_TIMESTAMP(), "
@@ -928,6 +945,7 @@ def complete_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int, contrac
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=staff_id,
                                      event_type="completed", detail=dict(contract_ref=ref)), ("detail",))
     _usage(db, tenant_id, "offer_completed", offer_id)
+    _offer_purchase(db, "contract", tenant_id, offer_id, staff_id, ref)
     _notify(db, tenant_id, "offer_completed", offer_id)
 
 
@@ -955,6 +973,7 @@ def cancel_offer(db: Db, tenant_id: str, actor_id: int, offer_id: int, reason: s
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=actor_id,
                                      event_type="cancelled", detail=dict(reason=reason, from_status=status,
                                                                         was_hedged=r[0]["hedged_at"] is not None)), ("detail",))
+    _offer_purchase(db, "void", tenant_id, offer_id, actor_id)
     _notify(db, tenant_id, "offer_cancelled", offer_id)
 
 

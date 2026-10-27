@@ -79,7 +79,7 @@ def test_staff_lands_on_offers_inbox_and_can_mark_hit(app_db):
     at = _as(app_db, 2)
     assert not at.exception
     assert any("5,000 bu Corn" in m.value for m in at.markdown)
-    next(b for b in at.button if b.label == "Mark hit").click().run()
+    next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
 
