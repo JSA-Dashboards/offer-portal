@@ -154,7 +154,10 @@ def test_a_futures_move_changes_no_stored_bid_offer_implied_futures_or_hedge(db)
 
     def snapshot():
         raw = db.query("SELECT bid_id, basis_cents, cash_price, active FROM bids ORDER BY bid_id")
-        return (raw, data.hedge_summary(db, "rcm", 2),
+        h = data.hedge_summary(db, "rcm", 2)               # the hedge numbers; the offers listed under each line carry
+        for key in ("now", "potential"):                   # live display fields (bid_reached ...), which are not the hedge
+            h[key] = [{k: v for k, v in line.items() if k != "offer_list"} for line in h[key]]
+        return (raw, h,
                 [(o["implied_futures"], o["status"]) for o in data.list_offers(db, "rcm", user(db, 2))])
     before = snapshot()
     futures.update_quotes(db, {"ZCZ26": _q(5.50)})                                 # a big rally

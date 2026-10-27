@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import requests
 
 BASE_URL = "https://api.massive.com/futures/v1"
+FX_BASE_URL = "https://api.massive.com/v2"
 
 _MONTH_CODES = "FGHJKMNQUVXZ"
 _TICKER_RE = re.compile(r"^([A-Z]{1,3})([FGHJKMNQUVXZ])(\d)$")
@@ -238,6 +239,27 @@ def get_prices(tickers: list[str], api_key: str) -> dict[str, float]:
         raise MassiveApiError(f"Massive snapshot request failed: {e}") from e
     return {t: price for t, snap in snapshots.items()
             if (price := _extract_price(snap)) is not None}
+
+
+def get_fx_history(pair: str, api_key: str, start: date, end: date) -> pd.Series:
+    """Daily closes of a currency pair such as "C:USDBRL" (reais per dollar), indexed by the
+    UTC date of each bar. Currencies are a separate Massive product from futures: another base
+    URL, and a "DELAYED" status that _get() would refuse. Weekend bars (the Sunday-evening
+    open) are dropped, so each date is a weekday's own close."""
+    url = f"{FX_BASE_URL}/aggs/ticker/{pair}/range/1/day/{start.isoformat()}/{end.isoformat()}"
+    try:
+        resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"},
+                            params={"adjusted": "true", "sort": "asc", "limit": 50000}, timeout=30)
+    except requests.RequestException as e:
+        raise MassiveApiError(f"Massive {pair} request failed: {e}") from e
+    if resp.status_code != 200:
+        raise MassiveApiError(f"Massive {pair} returned {resp.status_code}: {resp.text[:200]}")
+    closes: dict[date, float] = {}
+    for bar in resp.json().get("results", []):
+        day = datetime.fromtimestamp(bar["t"] / 1000, tz=timezone.utc).date()
+        if day.weekday() < 5 and bar.get("c"):
+            closes[day] = float(bar["c"])
+    return pd.Series(closes, dtype=float).sort_index() if closes else pd.Series(dtype=float)
 
 
 FED_FUNDS_PRODUCT = "ZQ"

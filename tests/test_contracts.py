@@ -67,3 +67,19 @@ def test_offer_needs_a_listed_month_and_hedge_summary_groups_by_futures_month(db
     assert rows == [("Corn", "ZCZ26", "Dec 2026", "CBOT", 15000, 3.0),            # nearest futures month first
                     ("Corn", "ZCH27", "Mar 2027", "CBOT", 5000, 1.0),
                     ("HRW Wheat", "KEH27", "Mar 2027", "KC", 5000, 1.0)]
+
+
+def test_hedge_price_levels_carry_the_offers_behind_them(db):
+    from portal import farmers
+    fid = farmers.create_farmer(db, "rcm", 2, "Pat Farmer", "555", entity_name="Farmer Bros LLC", client_id="10442")
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", basis_cents=-38, futures_symbol="ZCZ26")
+    bid = data.list_bids(db, "rcm")[0]["bid_id"]
+    mk = lambda basis, bu: data.place_offer_for_farmer(db, "rcm", 2, fid, grain="Corn", contract_type="HTA", price_type="BASIS",
+                                                       bushels=bu, basis_cents=basis, futures_symbol="ZCZ26", bid_id=bid)
+    a, b, c = mk(-30, 5000), mk(-30, 10000), mk(-35, 5000)
+    lines = data.hedge_summary(db, "rcm", 2)["potential"]
+    by_level = {l["level"]: l for l in lines}
+    assert sorted(o["offer_id"] for o in by_level[-30]["offer_list"]) == sorted([a, b])
+    assert [o["offer_id"] for o in by_level[-35]["offer_list"]] == [c]
+    assert all(l["offers"] == len(l["offer_list"]) and l["bushels"] == sum(o["bushels"] for o in l["offer_list"]) for l in lines)
+    assert by_level[-30]["offer_list"][0]["farmer_entity"] == "Farmer Bros LLC"

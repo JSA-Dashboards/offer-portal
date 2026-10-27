@@ -1214,7 +1214,7 @@ def _level_label(b: dict) -> str:
     return f"{int(b['level']):+d}¢ basis" if b["kind"] == "Basis (HTA)" else f"{b['level']:.4f}"
 
 
-def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = None) -> None:
+def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = None, key: str = "now") -> None:
     st.markdown("**Contracts by futures month**")
     st.dataframe([{"Commodity": t["grain"], "Futures month": f"{t['futures_month']} ({t['futures_symbol']})",
                    "Exchange": t["exchange"], "Offers": t["offers"],
@@ -1230,6 +1230,23 @@ def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = N
                    "Contracts": b["contracts"]} for b in lines],
                  hide_index=True, width="stretch",
                  column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
+    if lines:
+        pick = st.selectbox("Show the offers in a price level", range(len(lines)), key=f"hedge_levels_{key}",
+                            format_func=lambda i: (f"{lines[i]['grain']} · {lines[i]['futures_month']} · {lines[i]['kind']} · "
+                                                   f"{_level_label(lines[i])} · {lines[i]['offers']} offer"
+                                                   f"{'s' if lines[i]['offers'] != 1 else ''} · {lines[i]['bushels']:,} bu"))
+        st.dataframe([{"Farmer": o.get("farmer_name") or "", "Entity": o.get("farmer_entity") or "",
+                       "Client ID": o.get("farmer_client_id") or "", "Bushels": o["bushels"],
+                       "Contract type": CONTRACT_LABELS.get(o["contract_type"], o["contract_type"]),
+                       "Terms": (f"${o['price']:.2f}/bu" if o["price_type"] == "FIXED" else f"{o['basis_cents']:+d}¢ basis"),
+                       "Delivery": (f"{o['delivery_start']} → {o['delivery_end']}" if o.get("delivery_start") and o.get("delivery_end")
+                                    else str(o.get("delivery_start") or "")),
+                       "Status": data.STATUS_LABELS.get(o["status"], o["status"]),
+                       "Contract #": o.get("contract_ref") or "",
+                       "Entered by": o.get("placed_by_name") or ("the farmer" if o.get("farmer_user_id") else "staff")}
+                      for o in lines[pick]["offer_list"]],
+                     hide_index=True, width="stretch",
+                     column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
 
 
 @st.fragment
@@ -1261,7 +1278,7 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
     if not h["now"]:
         st.info("No hit offers are waiting to be hedged.")
     else:
-        _hedge_tables(h["now_totals"], h["now"], quotes)
+        _hedge_tables(h["now_totals"], h["now"], quotes, key="now")
         with st.expander("Mark offers as hedged"):
             picks = st.multiselect("Hit offers not yet hedged", h["now_offers"], key="hedge_pick",
                                    format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
@@ -1273,7 +1290,7 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
     if not h["potential"]:
         st.info("No outstanding offers.")
     else:
-        _hedge_tables(h["potential_totals"], h["potential"], quotes)
+        _hedge_tables(h["potential_totals"], h["potential"], quotes, key="potential")
     st.caption("Contracts = bushels divided by the contract size (5,000 bu for corn, soybeans and wheat). "
                "Flat-price offers show the implied futures price (flat price less the posted basis), and it moves "
                "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")

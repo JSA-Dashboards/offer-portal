@@ -210,3 +210,16 @@ def test_the_calendar_page_renders_and_staff_cannot_edit_bids(app_db):
     assert not at.exception and not [e for e in at.expander if e.label in ("Post a bid", "Retire a bid")]
     at = _go(_as(app_db, 2), "Bid Board")
     assert [e for e in at.expander if e.label == "Post a bid"]
+
+
+def test_hedge_page_has_a_dropdown_of_the_offers_in_each_price_level(app_db):
+    data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", location_id=1, basis_cents=-38, futures_symbol="ZCZ26")
+    bid = data.list_bids(app_db, "rcm")[0]["bid_id"]
+    for bu in (5000, 10000):
+        data.create_offer(app_db, "rcm", conftest.user(app_db, 1), grain="Corn", contract_type="HTA", price_type="BASIS",
+                          bushels=bu, basis_cents=-30, futures_symbol="ZCZ26", bid_id=bid)
+    at = _go(_as(app_db, 2), "Hedge")
+    box = next(s for s in at.selectbox if s.label == "Show the offers in a price level")
+    assert len(box.options) == 1 and "2 offers" in box.options[0] and "15,000 bu" in box.options[0]
+    frames = [d.value for d in at.dataframe]
+    assert any(len(f) == 2 and "Farmer" in f.columns and set(f["Bushels"]) == {5000, 10000} for f in frames)

@@ -1073,9 +1073,10 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
             key = (o["grain"], o["futures_symbol"], kind, level)
             b = buckets.setdefault(key, dict(grain=o["grain"], futures_symbol=o["futures_symbol"], kind=kind,
                                              futures_month=contracts.futures_label(o["futures_symbol"]),
-                                             level=level, offers=0, bushels=0))
+                                             level=level, offers=0, bushels=0, offer_list=[]))
             b["offers"] += 1
             b["bushels"] += o["bushels"]
+            b["offer_list"].append(o)                    # the offers behind this price level (the page lists them)
         lines = sorted(buckets.values(), key=lambda b: (_grain_rank(b["grain"]), contracts.sort_key(b["futures_symbol"]), b["kind"],
                                                          -(b["level"] if b["level"] is not None else -1e9)))
         for b in lines:
