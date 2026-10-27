@@ -87,10 +87,11 @@ def test_a_hit_tells_the_farmer_staff_and_admins_to_acknowledge(db):
 def test_an_automatic_hit_says_so(db):
     _setup(db)
     data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", basis_cents=-38, cash_price=4.50)
-    data.add_auto_hit_rule(db, "rcm", 2)
-    data.create_offer(db, "rcm", user(db, 1), grain="Corn", contract_type="CASH", price_type="FIXED", bushels=5000, price=4.30,
-                      futures_symbol="ZCZ26", bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
-    assert any("automatically by your auto-hit rules" in r["body_html"] for r in _box(db, "offer_hit"))
+    oid = data.create_offer(db, "rcm", user(db, 1), grain="Corn", contract_type="CASH", price_type="FIXED", bushels=5000, price=4.30,
+                            futures_symbol="ZCZ26", bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+    assert _box(db, "offer_hit") == []                                                  # not accepted yet: nothing can fill
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "accept")                             # the bid is already above its price
+    assert any("automatically when the bid reached its price" in r["body_html"] for r in _box(db, "offer_hit"))
 
 
 def test_completion_tells_the_farmer_the_contract_number(db):

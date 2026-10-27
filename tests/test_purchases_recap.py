@@ -109,8 +109,8 @@ def test_a_staff_recap_has_their_own_purchases_and_offers_plus_the_company_to_do
     h = r["html"]
     assert "Sam Bought From" in h and "Sue Bought From" not in h
     assert "10,000" in h and "7,000" not in h                                                   # his offer, not Sue's
-    assert "waiting to be acknowledged" in h and "3,000" in h                                   # company to-do list is shared
-    assert r["counts"] == dict(hit_today=0, working=1, need_ack=1, need_contract=0, purchases=1)
+    assert "waiting for Confirm Purchase" in h and "3,000" in h                                 # company to-do list is shared
+    assert r["counts"] == dict(hit_today=0, working=0, outstanding=1, need_ack=1, need_contract=0, purchases=1)
     assert "substantial risk of loss" in h and "your activity" in h and "Logged by" not in h
     assert mine and other
 
@@ -152,7 +152,8 @@ def test_recap_escapes_names_and_says_so_when_there_is_nothing(db):
     h = recap.build_recap(db, "rcm", dict(user_id=20, role="elevator_staff"))["html"]
     assert "<script>alert(1)</script>" not in h and "&lt;script&gt;" in h
     empty = recap.build_recap(db, "rcm", dict(user_id=21, role="elevator_staff"))["html"]
-    assert "No offers hit today." in empty and "No outstanding offers." in empty and "No purchases were logged today." in empty
+    assert "No offers filled today." in empty and "No outstanding offers." in empty and "No working offers." in empty
+    assert "No purchases were logged today." in empty
 
 
 def test_daily_recaps_go_to_staff_and_admins_once_a_day(db):

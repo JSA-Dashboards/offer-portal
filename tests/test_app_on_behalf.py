@@ -88,12 +88,12 @@ def test_staff_accepts_and_withdraws_for_a_phone_farmer(app_db):
     assert not any("ounter" in b.label for b in at.button)                  # no counter-offers anywhere
     next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception, at.exception
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "working"
     o2 = data.place_offer_for_farmer(app_db, "rcm", 2, fid, **terms)
     at = _as(app_db, 2)
     next(b for b in at.button if b.label == "Withdraw for farmer").click().run()
     assert {o["offer_id"]: o["status"] for o in data.list_offers(app_db, "rcm", conftest.user(app_db, 2))} == \
-        {o1: "hit", o2: "withdrawn"}
+        {o1: "working", o2: "withdrawn"}
 
 
 def test_farmers_screen_invites_a_farmer_to_the_portal(app_db, monkeypatch):

@@ -44,7 +44,7 @@ def latest_stamp(quotes: dict[str, dict]) -> str | None:
 def wanted_symbols(db: Db) -> list[str]:
     """Every futures month that matters right now, across tenants: live bids and open (outstanding or hit) offers."""
     rows = db.query("SELECT futures_symbol AS s FROM bids WHERE active AND futures_symbol IS NOT NULL "
-                    "UNION SELECT futures_symbol FROM offers WHERE status IN ('submitted', 'hit', 'acknowledged') "
+                    "UNION SELECT futures_symbol FROM offers WHERE status IN ('submitted', 'working', 'hit', 'acknowledged', 'completed') "
                     "AND futures_symbol IS NOT NULL")
     return sorted({r["s"] for r in rows if r["s"]})
 

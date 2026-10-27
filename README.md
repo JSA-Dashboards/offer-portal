@@ -7,16 +7,18 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 - **Bids:** staff post a bid board; scrapers (AgriCharts, Bushel) stage suggestions that an admin confirms.
   Posting a new bid replaces the live one for that slot and re-prices outstanding flat-price offers
   (flat price - basis = implied futures).
-- **Offers:** farmers (or staff on their behalf) make offers. Lifecycle: **Outstanding -> Hit -> Completed**
-  (completing requires a contract number and archives the offer), or Declined / Withdrawn / Expired.
-  There are no counter-offers.
+- **Offers:** farmers (or staff on their behalf) make offers. Flow: **Outstanding** (entered, not accepted) -> staff press
+  **Accept Offer** -> **Working Offers** (accepted, price not reached) -> the bid reaches the price and the offer moves to
+  **Filled Offers** by itself -> staff press **Confirm Purchase** with the contract number (required) -> **Completed** (today)
+  and, from tomorrow, **History**. Or Declined / Withdrawn / Expired / Cancelled (the Closed tab). There are no counter-offers.
+  An outstanding offer the bid has already reached is highlighted; accepting it fills it at once.
 - **Expiry:** an offer expires the day after the last day of its delivery period (its own dates, else the bid's range, else the
   end of its start month). Scraped bids need a clear delivery range; when the source doesn't give one, staff must enter it before approving.
 - **Summary:** offers by commodity and delivery period, filterable by entity, individual, commodity, period.
-- **Auto-hit (admin only):** rules that mark an outstanding offer hit automatically when the posted bid reaches it
-  (scope by location, commodity, contract type, largest offer). No active rules = never automatic.
-- **Hit -> acknowledge -> contract #:** a hit offer must be acknowledged by staff, then given a contract number to complete.
-  An offer cancelled after a hit emails admins to adjust the hedge and sits on the Hedge page until they confirm.
+- **Confirm Purchase:** the elevator takes the grain on: the offer is added to that day's purchases (and so the recap and the
+  summary), the contract number is recorded and the offer completes. Futures-only offers have no bid to reach, so staff
+  press **Mark Filled** on them. An offer cancelled after it was filled voids its purchase, emails admins to adjust the hedge
+  and sits on the Hedge page until they confirm.
 - **Email:** an outbox (`portal/notify.py`) emails farmers, staff and admins on offer events (the app flushes it after an
   action; `notify_run.py` on the droplet covers the rest). Everyone can switch their own notifications off.
 - **Purchases + daily recap:** staff log what they bought; each staff member gets their own end-of-day recap, admins the

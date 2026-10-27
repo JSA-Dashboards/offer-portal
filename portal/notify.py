@@ -141,7 +141,7 @@ def offer_event(db: Db, tenant_id: str, kind: str, offer_id: int, **ctx) -> int:
         plan.append((rcpt, f"New offer: {o['bushels']:,} bu {o['grain']} from {o.get('farmer_name') or 'a farmer'}",
                      _msg(tenant, f"{who} has an offer outstanding: {short}.", o)))
     elif kind == "offer_hit":
-        how = "automatically by your auto-hit rules" if ctx.get("auto") else "by staff"
+        how = "automatically when the bid reached its price" if ctx.get("auto") else "by staff"
         plan.append((staff, f"HIT: {o['bushels']:,} bu {o['grain']} ({o.get('farmer_name') or 'farmer'})",
                      _msg(tenant, f"An offer was hit {how}. <b>Confirm the purchase in the portal, then enter its contract number.</b>", o)))
         if farmer:

@@ -1,7 +1,7 @@
 """JSA Offer Portal Management — white-label grain offer manager. One app; the tenant comes from ?t=<slug>.
 
 Access by role (same portal, more or less in it): JSA platform admin (everything, every tenant) >
-elevator admin (bids, scraped bids, hedging, auto-hit, people, everything staff do) >
+elevator admin (bids, scraped bids, hedging, people, everything staff do) >
 elevator staff (offers, purchases, farmers; the bid board is read-only) >
 farmer (the bid board read-only, their own offers, delayed futures, the USDA calendar).
 """
@@ -357,7 +357,7 @@ def _repriced_msg(n: int) -> str:
         msg += (f" {int(n)} outstanding flat-price offer{'s' if n != 1 else ''} had the implied futures "
                 "price recalculated for the new basis.")
     if hit := getattr(n, "auto_hit", 0):
-        msg += f" {hit} offer{'s were' if hit != 1 else ' was'} hit automatically."
+        msg += f" {hit} working offer{'s were' if hit != 1 else ' was'} filled automatically."
     return msg
 
 
@@ -616,18 +616,22 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
             line.append(data.bid_gap(o))
         if staff and o.get("hedged_at"):
             line.append("hedge acknowledged")
-        elif staff and o["status"] in data.HELD:
+        elif staff and o["status"] in data.HEDGEABLE:
             line.append("hedge not yet acknowledged")
         st.markdown(_md(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]"))
-        if staff and o.get("bid_reached"):
+        if staff and o.get("bid_reached") and o["status"] == "submitted":
             st.markdown(":green-background[:material/bolt: Price reached: the posted bid is at this offer. "
-                        "Accept Offer to take it. It then moves to Hit.]")
+                        "Accept Offer now: it will fill straight away.]")
+        elif staff and o.get("bid_reached") and o["status"] == "working":
+            st.markdown(":green-background[:material/bolt: Price reached. Mark Filled if it has not moved to Filled Offers.]")
+        elif o["status"] == "working":
+            st.caption("Working: it moves to Filled Offers by itself when the bid reaches this price.")
         meta = [x for x in ((f"Delivery {o['delivery_start']}" + (f" → {o['delivery_end']}" if o["delivery_end"] else "")) if o["delivery_start"] else "",
                             (f"Good through {data.offer_delivery_end(o):%b %d, %Y}"
-                             if o["status"] == "submitted" and data.offer_delivery_end(o) else ""),
+                             if o["status"] in ("submitted", "working") and data.offer_delivery_end(o) else ""),
                             f"Good until {str(o['expires_at'])[:10]}" if o["expires_at"] else "",
-                            (f"Hit automatically {str(o['hit_at'])[:10]}" if o.get("auto_hit") else
-                             f"Hit {str(o['hit_at'])[:10]}") if o.get("hit_at") else "",
+                            (f"Filled automatically {str(o['hit_at'])[:10]}" if o.get("auto_hit") else
+                             f"Filled {str(o['hit_at'])[:10]}") if o.get("hit_at") else "",
                             (f"Acknowledged {str(o['acknowledged_at'])[:10]} by "
                              f"{o.get('acknowledged_by_name') or o.get('acknowledged_by_email') or 'staff'}")
                             if o.get("acknowledged_at") else "",
@@ -654,10 +658,11 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                         except data.PortalError as e:
                             st.error(str(e))
         key = str(o["offer_id"])
-        if o["status"] == "submitted":
-            # The elevator accepts an offer (it becomes Hit) or declines it. A farmer can withdraw their own; staff can
-            # record a withdrawal for a farmer who called in (flagged on_behalf in the offer history).
-            acts = ([("Accept Offer", "hit", "primary"), ("Decline", "decline", "secondary"),
+        if o["status"] in ("submitted", "working"):
+            # The elevator accepts an offer (it becomes a Working Offer) or declines it. A farmer can withdraw their own;
+            # staff can record a withdrawal for a farmer who called in (flagged on_behalf in the offer history).
+            first = ("Accept Offer", "accept") if o["status"] == "submitted" else ("Mark Filled", "hit")
+            acts = ([(first[0], first[1], "primary"), ("Decline", "decline", "secondary"),
                      ("Withdraw for farmer", "withdraw", "secondary")] if staff
                     else [("Withdraw", "withdraw", "secondary")])
             with st.container(horizontal=True):
@@ -672,22 +677,15 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                             _refresh()
                         except data.PortalError as e:
                             st.error(str(e))
-        elif o["status"] == "hit" and staff:
-            if st.button("Confirm Purchase", key=f"ack_{key}", type="primary",
-                         help="The elevator takes this grain on. It is added to today's purchases and the recap."):
-                try:
-                    data.acknowledge_offer(db, tenant_id, user["user_id"], o["offer_id"])
-                    _refresh()
-                except data.PortalError as e:
-                    st.error(str(e))
-        elif o["status"] == "acknowledged" and staff:
-            with st.form(f"complete_{key}", border=False):
+        elif o["status"] in ("hit", "acknowledged") and staff:
+            with st.form(f"confirm_{key}", border=False):
                 c1, c2 = st.columns([2, 1], vertical_alignment="bottom")
-                ref = c1.text_input("Contract number (required to complete)", o.get("contract_ref") or "",
-                                    max_chars=60)
-                if c2.form_submit_button("Complete and archive", type="primary"):
+                ref = c1.text_input("Contract number (required)", o.get("contract_ref") or "", max_chars=60,
+                                    key=f"cref_{key}")
+                if c2.form_submit_button("Confirm Purchase", type="primary",
+                                         help="The elevator takes this grain on: it is added to today's purchases and the daily summary."):
                     try:
-                        data.complete_offer(db, tenant_id, user["user_id"], o["offer_id"], ref)
+                        data.confirm_purchase(db, tenant_id, user["user_id"], o["offer_id"], ref)
                         _refresh()
                     except data.PortalError as e:
                         st.error(str(e))
@@ -706,8 +704,21 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
                             st.error(str(e))
 
 
-STAGES = {"Outstanding": ("submitted",), "Hit": ("hit",), "Acknowledged": ("acknowledged",),
-          "Completed": ("completed",), "Closed": ("declined", "withdrawn", "expired", "cancelled")}
+STAGES = {"Outstanding": ("submitted",),                       # entered, not accepted
+          "Working Offers": ("working",),                      # accepted, price not reached
+          "Filled Offers": ("hit", "acknowledged"),            # price reached; waiting for Confirm Purchase
+          "Completed": ("completed",),                         # confirmed today
+          "History": ("completed",),                           # confirmed on earlier days
+          "Closed": ("declined", "withdrawn", "expired", "cancelled")}
+
+
+def _in_stage(o: dict, stage: str, today: date) -> bool:
+    if o["status"] not in STAGES[stage]:
+        return False
+    if stage in ("Completed", "History"):                      # one status, split by the day it was confirmed (Central)
+        day = data.ct_date(o.get("completed_at")) or data.ct_date(o.get("acknowledged_at"))
+        return (day == today) if stage == "Completed" else (day != today)
+    return True
 
 
 _CAL_COLORS = {"wasde": ("#fdecd9", "#a45a16"), "nass": ("#e3f1e4", "#2f6b3a"), "weekly": ("#e8edf1", "#4c5a66")}
@@ -781,7 +792,8 @@ def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
     if staff and st.toggle("Only offers I placed", False, key="offers_mine",
                            help="Offers you entered on a farmer's behalf. Off shows the whole company's."):
         rows = [o for o in rows if o["placed_by"] == user["user_id"]]
-    counts = {k: sum(1 for o in rows if o["status"] in v) for k, v in STAGES.items()}
+    today = data.today_ct()
+    counts = {k: sum(1 for o in rows if _in_stage(o, k, today)) for k in STAGES}
     names = {f"{k} ({counts[k]})": k for k in STAGES}          # the counts change, so remember the stage by its name
     remembered = st.session_state.get("offers_stage")
     for label in _tab_pages(list(names), key="offers_tabs", default=next((l for l, k in names.items() if k == remembered), None)):
@@ -790,16 +802,22 @@ def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
 
 
 def _offers_stage(db, tenant_id: str, user: dict, staff: bool, rows: list[dict], stage: str) -> None:
-    shown = [o for o in rows if o["status"] in STAGES[stage]]
+    today = data.today_ct()
+    shown = [o for o in rows if _in_stage(o, stage, today)]
     if stage == "Outstanding":
         shown.sort(key=lambda o: not o["bid_reached"])          # offers the bid has reached float to the top
-    elif stage == "Hit" and staff:
-        st.caption("These offers have been accepted. Confirm Purchase on each one to take it on: it is added to today's "
-                   "purchases and the daily summary. Then enter its contract number to complete it.")
-    elif stage == "Acknowledged" and staff:
-        st.caption("Confirmed purchases. Enter the contract number to complete one and move it to the archive.")
+        if staff:
+            st.caption("Offers entered but not accepted. Accept Offer to start working one (it fills by itself when the bid "
+                       "reaches its price). Offers the bid has already reached are highlighted at the top.")
+    elif stage == "Working Offers":
+        st.caption("Accepted offers waiting for the bid to reach their price. Each moves to Filled Offers by itself when it does.")
+    elif stage == "Filled Offers" and staff:
+        st.caption("The bid reached these offers. Confirm Purchase on each one, with its contract number: the grain is "
+                   "taken on, added to today's purchases and the daily summary, and the offer moves to Completed.")
     elif stage == "Completed":
-        st.caption("Archive: completed offers, each with its contract number.")
+        st.caption("Purchases confirmed today, each with its contract number. They move to History tomorrow.")
+    elif stage == "History":
+        st.caption("Purchases confirmed on earlier days.")
     if not shown:
         st.info("No offers here.")
     for o in shown:
@@ -1179,7 +1197,7 @@ def summary_view(db, tenant_id: str, user: dict) -> None:
     periods = c2.multiselect("Delivery period", sorted({o["delivery_period"] for o in all_rows}))
     entity = c3.text_input("Entity name contains")
     indiv = c4.text_input("Individual name contains")
-    stages = st.multiselect("Stage", list(STAGES), default=["Outstanding", "Hit"])
+    stages = st.multiselect("Stage", [k for k in STAGES if k != "History"], default=["Outstanding", "Working Offers", "Filled Offers"])
     statuses = tuple(x for k in stages for x in STAGES[k])
     res = data.offer_summary(db, tenant_id, user["user_id"], grains=grains, periods=periods, entity=entity,
                              individual=indiv, statuses=statuses)
@@ -1278,28 +1296,28 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
                 if st.button("Hedge adjusted", key=f"hadj_{o['offer_id']}"):
                     data.mark_hedge_adjusted(db, tenant_id, user["user_id"], [o["offer_id"]])
                     _refresh()
-    st.subheader("Hit offers: acknowledge the hedge")
-    st.caption("A hit offer means the elevator owns the grain and its hedge should go on. When a hedge is on (or already "
+    st.subheader("Filled offers: acknowledge the hedge")
+    st.caption("A filled offer means the elevator owns the grain and its hedge should go on. When a hedge is on (or already "
                "was), acknowledge it here: the offer leaves the to-hedge list and moves to Hedges acknowledged, so the "
-               "same offer is never hedged twice. The table shows, for each futures month, what is hit, what is already "
+               "same offer is never hedged twice. The table shows, for each futures month, what is filled, what is already "
                "acknowledged as hedged, and what is still to hedge.")
     if h["position"]:
         st.dataframe([{"Commodity": p["grain"], "Futures month": f"{p['futures_month']} ({p['futures_symbol']})",
-                       "Hit (contracts)": p["hit_contracts"], "Hedge acknowledged (contracts)": p["hedged_contracts"],
+                       "Filled (contracts)": p["hit_contracts"], "Hedge acknowledged (contracts)": p["hedged_contracts"],
                        "Still to hedge (contracts)": p["todo_contracts"], "Still to hedge (bu)": p["todo_bushels"],
                        "Offers still to hedge": p["todo_offers"]} for p in h["position"]],
                      hide_index=True, width="stretch",
                      column_config={"Still to hedge (bu)": st.column_config.NumberColumn(format="%d")})
     if not h["now"]:
-        st.info("Every hit offer's hedge has been acknowledged." if h["position"] else "No hit offers right now.")
+        st.info("Every filled offer's hedge has been acknowledged." if h["position"] else "No filled offers right now.")
     else:
         _hedge_tables(h["now_totals"], h["now"], quotes, key="now")
-        picks = st.multiselect("Hit offers: choose the ones whose hedge is on", h["now_offers"], key="hedge_pick",
+        picks = st.multiselect("Filled offers: choose the ones whose hedge is on", h["now_offers"], key="hedge_pick",
                                format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
                                                      f"{o['futures_symbol']} · {o['price_type'].lower()} offer")
         months = {f"{t['grain']} · {t['futures_month']} ({t['futures_symbol']})": (t["grain"], t["futures_symbol"])
                   for t in h["now_totals"]}
-        whole = st.selectbox("…or every hit offer in one futures month", [""] + list(months), key="hedge_month",
+        whole = st.selectbox("…or every filled offer in one futures month", [""] + list(months), key="hedge_month",
                              format_func=lambda m: "—" if not m else m)
         chosen = list(picks)
         if whole:
@@ -1327,7 +1345,7 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
             if st.button("Put back on the to-hedge list", key="hedge_undo_go", disabled=not undo):
                 data.unmark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in undo])
                 _refresh()
-    st.subheader("Outstanding offers: if they are hit")
+    st.subheader("Outstanding and working offers: if they are filled")
     if not h["potential"]:
         st.info("No outstanding offers.")
     else:
@@ -1335,75 +1353,6 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
     st.caption("Contracts = bushels divided by the contract size (5,000 bu for corn, soybeans and wheat). "
                "Flat-price offers show the implied futures price (flat price less the posted basis), and it moves "
                "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")
-
-
-def _rule_text(r: dict, locs: dict) -> str:
-    scope = [locs.get(r["location_id"], "unknown location") if r["location_id"] is not None else "any location",
-             r["grain"] or "any commodity", r["contract_type"] or "cash and HTA"]
-    return " · ".join(scope) + (f" · up to {r['max_bushels']:,} bu per offer" if r["max_bushels"] else " · any size")
-
-
-@st.fragment
-def auto_hit_view(db, tenant_id: str, user: dict) -> None:
-    """Admin only: rules that mark an outstanding offer hit when the posted bid reaches it."""
-    if user["role"] not in ("elevator_admin", "platform_admin"):
-        st.error("This page is for elevator admins.")
-        return
-    uid = user["user_id"]
-    if msg := st.session_state.pop("auto_hit_msg", None):
-        st.success(msg)
-    st.caption("When the posted bid reaches an outstanding offer, it is marked hit automatically if an active rule "
-               "covers it. With no active rules nothing is ever hit automatically. A hit offer is executed on the "
-               "farmer's own terms; the bid that triggered it is saved in the offer's history. Offers outside every "
-               "rule (for example, larger than a rule's size limit) stay outstanding with a \"bid has reached\" flag "
-               "for staff. Flat-price offers need the bid to carry a cash price.")
-    locs = _loc_names(db, tenant_id)
-    rules = data.list_auto_hit_rules(db, tenant_id, uid)
-    st.subheader("Rules")
-    if not rules:
-        st.info("No rules yet. Offers are only hit when staff mark them.")
-    for r in rules:
-        with st.container(border=True, horizontal=True, vertical_alignment="center"):
-            st.markdown(_rule_text(r, locs))
-            on = st.toggle("Active", bool(r["active"]), key=f"ahr_{r['rule_id']}")
-            if on != bool(r["active"]):
-                n = data.set_auto_hit_rule_active(db, tenant_id, uid, r["rule_id"], on)
-                st.session_state["auto_hit_msg"] = (f"Rule switched on. {n} outstanding offer{'s' if n != 1 else ''} "
-                                                    "hit." if on else "Rule switched off.")
-                _refresh()
-    with st.expander("Add a rule", expanded=not rules):
-        with st.form("auto_hit_rule", clear_on_submit=True):
-            c1, c2, c3, c4 = st.columns(4)
-            loc = c1.selectbox("Location", [None] + list(locs), format_func=lambda x: "Any location" if x is None else locs[x])
-            grain = c2.selectbox("Commodity", [None] + list(GRAINS), format_func=lambda x: x or "Any commodity")
-            ctype = c3.selectbox("Contract type", [None, "CASH", "HTA"], format_func=lambda x: x or "Cash and HTA")
-            cap = c4.number_input("Largest offer (bu), blank = no limit", value=None, min_value=0, step=1000, format="%d")
-            if st.form_submit_button("Add rule", type="primary"):
-                try:
-                    n = data.add_auto_hit_rule(db, tenant_id, uid, location_id=loc, grain=grain, contract_type=ctype,
-                                               max_bushels=int(cap) if cap else None)
-                    st.session_state["auto_hit_msg"] = (f"Rule added. {n} outstanding offer{'s' if n != 1 else ''} "
-                                                        "already reached by the bid were hit.")
-                    _refresh()
-                except data.PortalError as e:
-                    st.error(str(e))
-    if st.button("Check outstanding offers now", key="auto_hit_now"):
-        n = data.check_auto_hit_now(db, tenant_id, uid)
-        st.session_state["auto_hit_msg"] = f"Checked. {n} offer{'s' if n != 1 else ''} hit."
-        _refresh()
-    st.subheader("Recently hit automatically")
-    recent = data.list_auto_hits(db, tenant_id, uid)
-    if not recent:
-        st.info("Nothing has been hit automatically yet.")
-    else:
-        st.dataframe([{"Hit": str(o["hit_at"])[:16], "Farmer": o["farmer_name"], "Client ID": o["farmer_client_id"] or "",
-                       "Commodity": o["grain"], "Futures month": o["futures_symbol"], "Bushels": o["bushels"],
-                       "Price": o["price"] if o["price_type"] == "FIXED" else None,
-                       "Basis (¢)": o["basis_cents"] if o["price_type"] == "BASIS" else None,
-                       "Stage": data.STATUS_LABELS.get(o["status"], o["status"]), "Rule": o["auto_hit_rule_id"]}
-                      for o in recent], hide_index=True, width="stretch",
-                     column_config={"Bushels": st.column_config.NumberColumn(format="%d"),
-                                    "Price": st.column_config.NumberColumn(format="$%.4f")})
 
 
 @st.fragment
@@ -1598,7 +1547,7 @@ def main() -> None:
     tid = tenant["tenant_id"]
     admin = user["role"] in ("elevator_admin", "platform_admin")
     seasonals = ["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []
-    views = (["Offers", "Place Offer", "Summary"] + (["Hedge", "Auto-Hit"] if admin else []) +
+    views = (["Offers", "Place Offer", "Summary"] + (["Hedge"] if admin else []) +
              ["Purchases", "Recap", "Bid Board"] + seasonals + ["USDA Calendar"] +
              (["Review Scraped Bids"] if admin else []) + ["Farmers", "People"] if staff
              else ["Bid Board", "Make an Offer", "My Offers"] + seasonals + ["USDA Calendar"])
@@ -1619,8 +1568,6 @@ def _render_page(db, tenant: dict, user: dict, view: str, staff: bool, admin: bo
         summary_view(db, tid, user)
     elif view == "Hedge":
         hedge_view(db, tid, user)
-    elif view == "Auto-Hit":
-        auto_hit_view(db, tid, user)
     elif view == "Purchases":
         purchases_view(db, tenant, user)
     elif view == "Recap":

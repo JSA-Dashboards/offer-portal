@@ -112,12 +112,12 @@ def test_expiry_tells_the_farmer_and_the_job_covers_every_tenant(db):
 
 def test_an_offer_whose_period_ended_is_expired_never_hit(db):
     data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", basis_cents=-20, cash_price=4.50)
-    data.add_auto_hit_rule(db, "rcm", 2)
     oid = _offer(db, delivery_end=D(5))                                                  # basis -30 <= bid -20: would be reached
-    assert _status(db, oid) == "submitted"                                                # (its basis is better than the bid's)
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "working"        # (its basis is better than the bid's)
     cheap = data.create_offer(db, "rcm", user(db, 1), **{**HTA, "basis_cents": -40}, delivery_end=D(5))
+    data.act_on_offer(db, "rcm", user(db, 2), cheap, "accept")
     _age(db, cheap, delivery_end=D(-1))
-    assert data.run_auto_hit(db, "rcm") == 0 and _status(db, cheap) == "expired"
+    assert data.run_auto_hit(db, "rcm") == 0 and _status(db, cheap) == "expired"         # lapsed: expired, never filled
 
 
 def test_a_delivery_period_that_has_already_ended_cannot_be_offered(db):

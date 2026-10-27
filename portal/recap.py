@@ -72,7 +72,8 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
     def mine(o):                                   # staff: offers they entered or acknowledged
         return admin or o.get("placed_by") == user["user_id"] or o.get("acknowledged_by") == user["user_id"]
     hit_today = [o for o in offers if _ct_date(o.get("hit_at")) == day and mine(o)]
-    working = [o for o in offers if o["status"] == "submitted" and mine(o)]
+    working = [o for o in offers if o["status"] == "working" and mine(o)]
+    outstanding = [o for o in offers if o["status"] == "submitted" and mine(o)]
     need_ack = [o for o in offers if o["status"] == "hit"]
     need_contract = [o for o in offers if o["status"] == "acknowledged"]
     buys = purchases.list_purchases(db, tenant_id, user, day)
@@ -83,17 +84,19 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
     if need_ack or need_contract:
         parts.append(_h("To do"))
         if need_ack:
-            parts.append(f"<p><b>{len(need_ack)}</b> hit offer{'s' if len(need_ack) != 1 else ''} waiting to be acknowledged.</p>")
+            parts.append(f"<p><b>{len(need_ack)}</b> filled offer{'s' if len(need_ack) != 1 else ''} waiting for Confirm Purchase.</p>")
             parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in need_ack], ""))
         if need_contract:
-            parts.append(f"<p><b>{len(need_contract)}</b> acknowledged offer{'s' if len(need_contract) != 1 else ''} "
+            parts.append(f"<p><b>{len(need_contract)}</b> confirmed offer{'s' if len(need_contract) != 1 else ''} "
                          f"waiting for a contract number.</p>")
             parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in need_contract], ""))
-    parts.append(_h("Offers that hit today"))
-    parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in hit_today], "No offers hit today."))
-    parts.append(_h("Offers still working"))
-    work_rows = sorted(working, key=lambda o: (o["grain"], o["delivery_period"], o["farmer_name"] or ""))
-    parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in work_rows], "No outstanding offers."))
+    parts.append(_h("Offers filled today"))
+    parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in hit_today], "No offers filled today."))
+    by_grain = lambda o: (o["grain"], o["delivery_period"], o["farmer_name"] or "")
+    parts.append(_h("Working offers (accepted, waiting for the price)"))
+    parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in sorted(working, key=by_grain)], "No working offers."))
+    parts.append(_h("Outstanding offers (not yet accepted)"))
+    parts.append(_table(OFFER_HEAD, [_offer_row(o) for o in sorted(outstanding, key=by_grain)], "No outstanding offers."))
     parts.append(_h("Purchases made today" + ("" if admin else " (yours)") + " (includes offers acknowledged today)"))
     if not buy_groups:
         parts.append("<p style='color:#8a9199;font-size:13px'>No purchases were logged today.</p>")
@@ -122,7 +125,7 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
         parts.append(_table(["Commodity", "Futures month", "Offers", "Bushels", "Contracts", "Whole", "Left over (bu)"],
                             [[t["grain"], t["futures_symbol"], t["offers"], f"{t['bushels']:,}", t["contracts"],
                               t["whole_contracts"], f"{t['remainder_bushels']:,}"] for t in h["now_totals"]],
-                            "No hit offers waiting to be hedged."))
+                            "No filled offers waiting to be hedged."))
         if h["adjustments"]:
             parts.append(f"<p style='color:#b42318'><b>{len(h['adjustments'])}</b> cancelled offer"
                          f"{'s' if len(h['adjustments']) != 1 else ''} still need a hedge adjustment.</p>")
@@ -132,7 +135,7 @@ def build_recap(db: Db, tenant_id: str, user: dict, day: date | None = None) -> 
         link = f"<p><a href=\"{_e(portal_link(tenant_id))}\">Open the portal</a></p>"
     body = theme.email_html(tenant, "".join(parts) + link)
     return dict(subject=f"{tenant.get('name', tenant_id)} daily recap: {day.strftime('%a %b %d')}", html=body,
-                counts=dict(hit_today=len(hit_today), working=len(working), need_ack=len(need_ack),
+                counts=dict(hit_today=len(hit_today), working=len(working), outstanding=len(outstanding), need_ack=len(need_ack),
                             need_contract=len(need_contract), purchases=len(buys)))
 
 

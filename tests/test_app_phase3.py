@@ -118,6 +118,6 @@ def test_an_action_in_the_app_sends_the_queued_emails_right_away(app_db, monkeyp
     next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception, at.exception
     got = sorted(to for to, _ in sent)
-    assert got == sorted(["admin@rcm.example", "sam@rcm.example", "sue@rcm.example",         # new-offer emails
-                          "admin@rcm.example", "sam@rcm.example", "sue@rcm.example", "farmer@a.example"])   # + the hit emails
+    assert got == sorted(["admin@rcm.example", "sam@rcm.example", "sue@rcm.example"])        # the new-offer emails go out now;
+    # accepting does not email anyone (nothing has filled yet): the hit emails come when the price is reached
     assert all(r["status"] == "sent" for r in app_db.query("SELECT status FROM notifications"))

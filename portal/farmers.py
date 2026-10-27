@@ -93,7 +93,7 @@ def list_farmers(db: Db, tenant_id: str, staff_id: int, include_inactive: bool =
     sql = ("SELECT f.farmer_id, f.name, f.individual_name, f.entity_name, f.client_id, f.phone, f.email, f.notify_email, "
            "f.user_id, f.active, "
            "(SELECT COUNT(*) FROM offers o WHERE o.farmer_id = f.farmer_id AND o.tenant_id = f.tenant_id "
-           "AND o.status = 'submitted') AS open_offers "
+           "AND o.status IN ('submitted', 'working')) AS open_offers "
            "FROM farmers f WHERE f.tenant_id = %s")
     if not include_inactive:
         sql += " AND f.active"

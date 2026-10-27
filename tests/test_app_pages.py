@@ -26,10 +26,10 @@ def _hit_offer(db):
 
 def test_navigation_by_role(app_db):
     admin = _views(_as(app_db, 2))                                                         # elevator admin
-    assert [v for v in admin if v not in ("Hedge", "Auto-Hit")] == [
+    assert [v for v in admin if v != "Hedge"] == [
         "Offers", "Place Offer", "Summary", "Purchases", "Recap", "Bid Board", "Grain Futures Seasonals", "USDA Calendar",
         "Review Scraped Bids", "Farmers", "People"]                                        # the order Kolten set, in Title Case
-    assert admin[3:5] == ["Hedge", "Auto-Hit"]                                             # admin-only pages follow Summary
+    assert admin[3] == "Hedge"                                                             # the admin-only page follows Summary
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     staff = _views(_as(app_db, 20))
     assert "Summary" in staff and "Hedge" not in staff                                   # staff don't get the hedge page
@@ -37,39 +37,59 @@ def test_navigation_by_role(app_db):
     assert not {"Summary", "Hedge", "Farmers", "Place Offer"} & set(farmer)
 
 
-def test_offers_page_has_outstanding_hit_completed_closed_stages_with_counts(app_db):
+def test_offers_page_stages_outstanding_working_filled_completed_history_closed(app_db):
     _hit_offer(app_db)
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT)
     at = _as(app_db, 2)
-    assert stages(at) == ["Outstanding (1)", "Hit (1)", "Acknowledged (0)", "Completed (0)", "Closed (0)"]
+    assert stages(at) == ["Outstanding (1)", "Working Offers (0)", "Filled Offers (1)", "Completed (0)", "History (0)", "Closed (0)"]
     assert any("5,000 bu Corn" in m.value for m in at.markdown)
-    assert any(b.label == "Accept Offer" for b in at.button)                                  # outstanding stage
-    stage(at, "Hit")
+    assert any(b.label == "Accept Offer" for b in at.button)                                  # outstanding: not yet accepted
+    stage(at, "Filled Offers")
     assert not at.exception, at.exception
-    assert any(b.label == "Confirm Purchase" for b in at.button)                              # hit stage: acknowledge first
-    assert not any(b.label == "Complete and archive" for b in at.button)
+    assert any(b.label == "Confirm Purchase" for b in at.button)                              # filled: confirm with a contract number
+    assert any(t.label.startswith("Contract number") for t in at.text_input)
+    assert not any(b.label == "Accept Offer" for b in at.button)
 
 
-def test_hit_offer_needs_a_contract_number_then_moves_to_completed(app_db):
+def test_confirm_purchase_needs_a_contract_number_then_the_offer_is_completed_and_a_purchase(app_db):
+    from portal import purchases
     oid = _hit_offer(app_db)
     at = _as(app_db, 2)
-    stage(at, "Hit")
+    stage(at, "Filled Offers")
     assert any("implied futures 4.6800" in m.value for m in at.markdown)
-    next(b for b in at.button if b.label == "Confirm Purchase").click().run()                # staff takes it on ...
-    assert not at.exception, at.exception
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"
-    stage(at, "Acknowledged")                                          # ... then must enter the contract number
-    next(b for b in at.button if b.label == "Complete and archive").click().run()
+    next(b for b in at.button if b.label == "Confirm Purchase").click().run()                 # no contract number yet
     assert at.error and "contract number" in at.error[0].value.lower()
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "acknowledged"   # still not completed
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"    # untouched
+    assert purchases.list_purchases(app_db, "rcm", conftest.user(app_db, 2)) == []
     next(t for t in at.text_input if t.label.startswith("Contract number")).set_value("C-5531")
-    next(b for b in at.button if b.label == "Complete and archive").click().run()
+    next(b for b in at.button if b.label == "Confirm Purchase").click().run()
     assert not at.exception, at.exception
     o = data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]
     assert (o["offer_id"], o["status"], o["contract_ref"]) == (oid, "completed", "C-5531")
-    stage(at, "Completed")
+    (p,) = purchases.list_purchases(app_db, "rcm", conftest.user(app_db, 2))                  # today's purchases
+    assert (p["offer_id"], p["contract_ref"]) == (oid, "C-5531")
+    stage(at, "Completed")                                                                    # confirmed today
     assert any("Contract # C-5531" in c.value for c in at.caption)
-    assert not any(b.label == "Complete and archive" for b in at.button)                  # archived: read-only
+    assert not any(b.label == "Confirm Purchase" for b in at.button)                          # read-only now
+
+
+def test_completed_is_today_and_history_is_every_earlier_day(app_db):
+    oid = _hit_offer(app_db)
+    data.confirm_purchase(app_db, "rcm", 2, oid, "C-1")
+    old = _hit_offer_again(app_db)
+    data.confirm_purchase(app_db, "rcm", 2, old, "C-0")
+    app_db.execute("UPDATE offers SET completed_at = '2026-01-05 18:00:00', acknowledged_at = '2026-01-05 18:00:00' "
+                   "WHERE offer_id = %s", (old,))
+    at = _as(app_db, 2)
+    assert "Completed (1)" in stages(at) and "History (1)" in stages(at)
+    stage(at, "History")
+    assert any("Contract # C-0" in c.value for c in at.caption) and not any("Contract # C-1" in c.value for c in at.caption)
+
+
+def _hit_offer_again(db):
+    oid = data.create_offer(db, "rcm", conftest.user(db, 1), **FLAT, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+    data.act_on_offer(db, "rcm", conftest.user(db, 2), oid, "hit")
+    return oid
 
 
 def test_summary_page_filters_by_commodity_period_entity_and_individual(app_db):
@@ -100,11 +120,11 @@ def test_hedge_page_shows_contracts_and_marks_offers_hedged(app_db):
     assert len(at.dataframe) >= 5                                                          # position + now + potential tables
     assert any("implied futures" in c.value for c in at.caption)
     position = at.dataframe[0].value
-    assert list(position["Hit (contracts)"]) == [1.0] and list(position["Still to hedge (contracts)"]) == [1.0]
+    assert list(position["Filled (contracts)"]) == [1.0] and list(position["Still to hedge (contracts)"]) == [1.0]
     assert list(position["Hedge acknowledged (contracts)"]) == [0.0]
     now_totals = at.dataframe[1].value
     assert list(now_totals["Contracts"]) == [1.0] and list(now_totals["Bushels"]) == [5000]
-    {m.label: m for m in at.multiselect}["Hit offers: choose the ones whose hedge is on"].select(
+    {m.label: m for m in at.multiselect}["Filled offers: choose the ones whose hedge is on"].select(
         data.hedge_summary(app_db, "rcm", 2)["now_offers"][0]).run()
     ack = lambda: next(b for b in at.button if b.label.startswith("Acknowledge hedge"))
     assert ack().disabled                                                                  # nothing happens until they confirm
@@ -141,53 +161,45 @@ def data_month():
     return date.today().strftime("%Y-%m")
 
 
-# ── auto-hit page ────────────────────────────────────────────────────────────
-def _reached_offer(db):
+# ── accept -> working -> filled ──────────────────────────────────────────────
+def _outstanding_offer(db, cash=4.18):
     data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2026-12", futures_symbol="ZCZ26",
-                     basis_cents=-38, cash_price=4.50)
+                     basis_cents=-38, cash_price=cash)
     return data.create_offer(db, "rcm", conftest.user(db, 1), **FLAT, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
 
 
-def test_auto_hit_page_is_admin_only(app_db):
-    assert "Auto-Hit" in _views(_as(app_db, 2))
-    app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
-    assert "Auto-Hit" not in _views(_as(app_db, 20))
-    assert "Auto-Hit" not in _views(_as(app_db, 1))
+def test_there_is_no_auto_hit_page_any_more(app_db):
+    assert "Auto-Hit" not in _views(_as(app_db, 2))
 
 
-def test_adding_a_rule_hits_offers_the_bid_already_reached(app_db):
-    oid = _reached_offer(app_db)
-    at = _go(_as(app_db, 2), "Auto-Hit")
-    assert any("No rules yet" in i.value for i in at.info)
-    next(b for b in at.button if b.label == "Add rule").click().run()               # default = any scope, no size limit
+def test_accept_offer_moves_an_outstanding_offer_to_working(app_db):
+    oid = _outstanding_offer(app_db)                                                          # bid 4.18 < the offer's 4.30
+    at = _as(app_db, 2)
+    next(b for b in at.button if b.label == "Accept Offer").click().run()
     assert not at.exception, at.exception
-    assert not at.error, [e.value for e in at.error]
-    assert any("Rule added. 1 outstanding offer" in s.value for s in at.success)
-    o = [x for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 2)) if x["offer_id"] == oid][0]
-    assert (o["status"], o["auto_hit"]) == ("hit", 1)
-    assert at.dataframe and list(at.dataframe[0].value["Bushels"]) == [5000]          # listed under "recently hit"
-    goto(at, "Offers")
-    stage(at, "Hit")
-    assert any("Hit automatically" in c.value for c in at.caption)
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "working"
+    assert "Outstanding (0)" in stages(at) and "Working Offers (1)" in stages(at)
+    stage(at, "Working Offers")
+    assert any("moves to Filled Offers by itself" in c.value for c in at.caption)
+    assert not any(b.label == "Accept Offer" for b in at.button)
 
 
-def test_rule_toggle_and_check_now(app_db):
-    data.add_auto_hit_rule(app_db, "rcm", 2, max_bushels=1000)                        # too small to cover a 5,000 bu offer
-    oid = _reached_offer(app_db)
-    at = _go(_as(app_db, 2), "Auto-Hit")
-    assert any("up to 1,000 bu per offer" in m.value for m in at.markdown)
-    next(b for b in at.button if b.label == "Check outstanding offers now").click().run()
-    assert any("Checked. 0 offers hit." in s.value for s in at.success)
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
+def test_a_price_reached_outstanding_offer_is_highlighted_and_fills_the_moment_it_is_accepted(app_db):
+    oid = _outstanding_offer(app_db, cash=4.50)                                               # the bid is already above 4.30
+    at = _as(app_db, 2)
+    assert any("Price reached" in m.value for m in at.markdown)                               # the green banner
+    next(b for b in at.button if b.label == "Accept Offer").click().run()
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
+    assert "Filled Offers (1)" in stages(at)
 
 
-def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
-    data.add_auto_hit_rule(app_db, "rcm", 2)
+def test_posting_a_bid_says_how_many_working_offers_were_filled_automatically(app_db):
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month=data_month(), futures_symbol=contracts.options("Corn")[0],
                      location_id=1, basis_cents=-38, cash_price=4.18)
     oid = data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **FLAT,
-                            bid_id=data.list_bids(app_db, "rcm")[0]["bid_id"])           # 4.30 > bid 4.18: outstanding
-    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "submitted"
+                            bid_id=data.list_bids(app_db, "rcm")[0]["bid_id"])               # 4.30 > bid 4.18: stays working
+    data.act_on_offer(app_db, "rcm", conftest.user(app_db, 2), oid, "accept")
+    assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "working"
     at = _go(_as(app_db, 2), "Bid Board")
     next(s for s in at.selectbox if s.label.startswith("Commodity and futures month")).set_value("Corn|" + contracts.options("Corn")[0])
     next(n for n in at.number_input if n.label.startswith("Basis")).set_value(-30)
@@ -196,7 +208,7 @@ def test_posting_a_bid_says_how_many_offers_were_hit_automatically(app_db):
     next(b for b in at.button if b.label == "Post bid").click().run()
     assert not at.exception, at.exception
     assert not at.error, [e.value for e in at.error]
-    assert any("1 offer was hit automatically" in s.value for s in at.success)
+    assert any("1 working offer was filled automatically" in s.value for s in at.success)
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]["status"] == "hit"
 
 
@@ -205,8 +217,9 @@ def test_each_role_sees_its_own_set_of_pages(app_db):
     farmer, staff, admin = (set(_views(_as(app_db, u))) for u in (1, 20, 2))
     assert farmer == {"Bid Board", "Make an Offer", "My Offers", "USDA Calendar"}
     assert {"Offers", "Purchases", "Place Offer", "Bid Board", "USDA Calendar"} <= staff
-    assert not staff & {"Hedge", "Auto-Hit", "Review Scraped Bids"}            # admin only
-    assert staff < admin and {"Hedge", "Auto-Hit", "Review Scraped Bids"} <= admin
+    assert not staff & {"Hedge", "Review Scraped Bids"}            # admin only
+    assert staff < admin and {"Hedge", "Review Scraped Bids"} <= admin
+    assert "Auto-Hit" not in admin                                            # offers fill by themselves now: no rules page
 
 
 def test_the_calendar_page_renders_and_staff_cannot_edit_bids(app_db):

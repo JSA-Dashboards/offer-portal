@@ -181,29 +181,31 @@ def test_offers_are_compared_with_the_live_flat_bid(db):
 def test_a_stale_quote_prices_nothing_and_hits_nothing(db):
     _riverton(db)
     bid = _bid(db)
-    data.add_auto_hit_rule(db, "rcm", 2)
     futures.update_quotes(db, {"ZCZ26": _q(4.70)})
     data.act_on_offer(db, "rcm", user(db, 2), data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "price": 9.99},
                                                                bid_id=bid["bid_id"]), "decline")   # unrelated, just seeding
     oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])
-    assert [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["status"] == "hit"   # fresh: hit
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "accept")
+    assert [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["status"] == "hit"   # fresh: filled
     oid2 = data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "bushels": 6000}, bid_id=bid["bid_id"])
     _age_quotes(db, data.QUOTE_MAX_AGE_MIN + 5)                                       # the feed has stopped
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid2, "accept") == "working"      # accepted, but nothing prices it now
     b = data.list_bids(db, "rcm")[0]
     assert (b["flat_price"], b["flat_source"]) == (None, "stale")
     assert data.run_auto_hit(db, "rcm") == 0
     assert [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid2][0]["bid_reached"] is False
 
 
-def test_run_update_hits_offers_the_new_flat_bid_reaches_only_when_a_rule_allows_it(db):
+def test_run_update_fills_working_offers_the_new_flat_bid_reaches_and_only_those(db):
     _riverton(db)
     bid = _bid(db)
     oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=bid["bid_id"])    # sells at 4.30
-    status = lambda: [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == oid][0]["status"]
-    out = futures.run_update(db, fetch=lambda syms: {"ZCZ26": _q(4.70)})
-    assert out["status"] == "ok" and out["tenants"]["rcm"] == {"auto_hit": 0} and status() == "submitted"   # no rule: flagged only
-    data.add_auto_hit_rule(db, "rcm", 2)                                                # adding the rule hits it at once
-    assert status() == "hit"
+    idle = data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "bushels": 7000}, bid_id=bid["bid_id"])   # never accepted
+    status = lambda i: [o for o in data.list_offers(db, "rcm", user(db, 2)) if o["offer_id"] == i][0]["status"]
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "working"     # the posted bid (4.18) is below 4.30
+    out = futures.run_update(db, fetch=lambda syms: {"ZCZ26": _q(4.70)})              # live flat bid 4.32 reaches it
+    assert out["status"] == "ok" and out["tenants"]["rcm"] == {"auto_hit": 1}
+    assert status(oid) == "hit" and status(idle) == "submitted"                       # accepted ones fill; others wait to be accepted
     ev = db.query("SELECT detail FROM offer_events WHERE offer_id = %s AND event_type = 'hit'", (oid,))[0]["detail"]
     assert '"auto_hit": true' in ev and '"bid_flat_price": 4.32' in ev and '"flat_source": "futures"' in ev   # the live flat bid that triggered it
     assert '"futures_quote": 4.7' in ev

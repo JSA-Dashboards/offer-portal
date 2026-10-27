@@ -40,7 +40,7 @@ def test_staff_work_offers_farmers_and_purchases_but_not_hedging(staff_db):
                                       bushels=5000, basis_cents=-30, futures_symbol="ZCZ26")
     assert data.list_offers(db, "rcm", user(db, 20))[0]["offer_id"] == oid          # staff see the company's offers
     purchases.add_purchase(db, "rcm", 20, grain="Corn", bushels=5000, counterparty="Smith", price=4.2)
-    for fn in (lambda: data.hedge_summary(db, "rcm", 20), lambda: data.add_auto_hit_rule(db, "rcm", 20)):
+    for fn in (lambda: data.hedge_summary(db, "rcm", 20), lambda: data.mark_hedged(db, "rcm", 20, [oid])):
         with pytest.raises(PortalError):
             fn()
     data.hedge_summary(db, "rcm", 2)                      # admin and

@@ -25,15 +25,21 @@ ROLES = ("platform_admin", "elevator_admin", "elevator_staff", "farmer")
 ELEVATOR_ROLES = ("elevator_admin", "elevator_staff")
 
 # status -> {action: (new_status, roles allowed)}
+# The flow: entered (submitted = "Outstanding") -> Accept Offer -> working ("Working Offers": accepted, price not reached)
+# -> the bid reaches it: hit ("Filled Offers", automatic) -> Confirm Purchase with a contract number -> completed.
+# "hit" straight from submitted stays possible at the data layer (the market is already at the price).
 _TRANSITIONS = {
-    "submitted": {"hit": ("hit", ELEVATOR_ROLES), "decline": ("declined", ELEVATOR_ROLES),
-                  "withdraw": ("withdrawn", ("farmer",)), "expire": ("expired", ())},
-}                                     # hit -> acknowledged -> completed: acknowledge_offer / complete_offer; cancel_offer after a hit
+    "submitted": {"accept": ("working", ELEVATOR_ROLES), "hit": ("hit", ELEVATOR_ROLES),
+                  "decline": ("declined", ELEVATOR_ROLES), "withdraw": ("withdrawn", ("farmer",)), "expire": ("expired", ())},
+    "working": {"hit": ("hit", ELEVATOR_ROLES), "decline": ("declined", ELEVATOR_ROLES),
+                "withdraw": ("withdrawn", ("farmer",)), "expire": ("expired", ())},
+}                                     # hit -> completed: confirm_purchase (acknowledge + contract number); cancel_offer after a hit
 
 CONTRACT_BUSHELS = {**{g: sp["bushels"] for g, sp in contracts.SPECS.items()}, **{k: 5000 for k in contracts.LEGACY}}
-STATUS_LABELS = {"submitted": "Outstanding", "hit": "Hit", "acknowledged": "Acknowledged", "completed": "Completed",
+STATUS_LABELS = {"submitted": "Outstanding", "working": "Working", "hit": "Filled", "acknowledged": "Confirmed", "completed": "Completed",
                  "declined": "Declined", "withdrawn": "Withdrawn", "expired": "Expired", "cancelled": "Cancelled"}
-HELD = ("hit", "acknowledged")        # the elevator owns the grain and the hedge question is open
+HELD = ("hit", "acknowledged")        # filled, purchase not yet completed
+HEDGEABLE = ("hit", "acknowledged", "completed")   # the elevator owns the grain: each of these needs its hedge acknowledged
 
 
 class PortalError(ValueError):
@@ -250,7 +256,7 @@ def publish_bid(db: Db, tenant_id: str, actor_id: int, *, grain: str, delivery_m
         db.execute("UPDATE bids SET active = FALSE WHERE bid_id = %s AND tenant_id = %s", (oid, tenant_id))
         # Outstanding offers made against the replaced bid follow the new one (any price type), so they
         # keep a live reference for pricing and for the hit check.
-        db.execute("UPDATE offers SET bid_id = %s WHERE tenant_id = %s AND status = 'submitted' AND bid_id = %s",
+        db.execute("UPDATE offers SET bid_id = %s WHERE tenant_id = %s AND status IN ('submitted', 'working') AND bid_id = %s",
                    (new_bid_id, tenant_id, oid))
     _usage(db, tenant_id, "bid_published")
     _audit(db, tenant_id, actor_id, "bid_published", dict(grain=grain, delivery_month=delivery_month))
@@ -448,7 +454,7 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
     if bid["basis_cents"] is None:
         return 0
     n = 0
-    rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'submitted' AND price_type = 'FIXED' "
+    rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status IN ('submitted', 'working') AND price_type = 'FIXED' "
                     "AND contract_type <> 'FUTURES_ONLY'", (tenant_id,))
     for o in rows:
         linked = o["bid_id"] is not None and (o["bid_id"] in old_ids or o["bid_id"] == bid["bid_id"])
@@ -476,7 +482,7 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
 
 def bid_reached(offer: dict, bid: dict | None) -> bool:
     """Has the live bid come up to this outstanding offer? (A prompt for staff to accept it.)"""
-    if bid is None or offer["status"] != "submitted":
+    if bid is None or offer["status"] not in ("submitted", "working"):
         return False
     if offer["price_type"] == "FIXED":
         flat = bid["flat_price"] if "flat_price" in bid else bid.get("cash_price")      # live: futures + basis
@@ -591,8 +597,6 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
                     on_behalf=placed_by is not None)), ("detail",))
     _usage(db, tenant_id, "offer_submitted", oid)
     _notify(db, tenant_id, "offer_submitted", oid)
-    _auto_hit_one(db, tenant_id, db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s",
-                                          (oid, tenant_id))[0], list_bids(db, tenant_id), _auto_rules(db, tenant_id))
     return oid
 
 
@@ -638,7 +642,7 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
     bids = list_bids(db, tenant_id)
     for o in rows:
         o["delivery_period"] = delivery_period(o)
-        o["bid_reached"] = bid_reached(o, _reference_bid(o, bids)) if o["status"] == "submitted" else False
+        o["bid_reached"] = bid_reached(o, _reference_bid(o, bids)) if o["status"] in ("submitted", "working") else False
     return rows
 
 
@@ -669,7 +673,7 @@ def expire_stale(db: Db, tenant_id: str) -> int:
     from .auth import _as_utc
     now, today, n = datetime.now(timezone.utc), today_ct(), 0
     for o in db.query("SELECT offer_id, expires_at, delivery_start, delivery_end, bid_snapshot FROM offers "
-                      "WHERE tenant_id = %s AND status = 'submitted'", (tenant_id,)):
+                      "WHERE tenant_id = %s AND status IN ('submitted', 'working')", (tenant_id,)):
         end = offer_delivery_end(o)
         if o["expires_at"] is not None and _as_utc(o["expires_at"]) <= now:
             reason = "good_until"
@@ -703,23 +707,22 @@ def _hit_context(bid: dict | None) -> dict:
                 quote_as_of=bid.get("quote_as_of"), posted_cash_price=bid["cash_price"])
 
 
-def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, rule: dict | None = None,
+def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, auto: bool = False,
               bid: dict | None = None) -> None:
-    """The one place an offer becomes hit: staff clicking Accept Offer, or an auto-hit rule (rule given,
-    actor None). Writes the status, the history event, the confirmation, and the billing usage. Either way the
-    live price context at the moment of the hit is saved with the event and the confirmation."""
-    auto = rule is not None
+    """The one place an offer becomes hit (Filled): the bid reaching a working offer (auto, actor None) or staff marking it
+    filled. Writes the status, the history event, the confirmation, and the billing usage. Either way the live price
+    context at the moment of the hit is saved with the event and the confirmation."""
     cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
-    if bid is None:                                      # a manual hit: look up the bid that prices this offer
+    if bid is None:                                      # a manual fill: look up the bid that prices this offer
         bid = _reference_bid(cur, list_bids(db, tenant_id))
     ctx = _hit_context(bid)
     db.execute("UPDATE offers SET status = 'hit', hit_at = CURRENT_TIMESTAMP(), hit_by = %s, auto_hit = %s, "
-               "auto_hit_rule_id = %s, updated_at = CURRENT_TIMESTAMP() "
-               "WHERE offer_id = %s AND tenant_id = %s AND status = 'submitted'",
-               (actor_id, auto, rule["rule_id"] if auto else None, offer_id, tenant_id))
+               "updated_at = CURRENT_TIMESTAMP() "
+               "WHERE offer_id = %s AND tenant_id = %s AND status IN ('submitted', 'working')",
+               (actor_id, auto, offer_id, tenant_id))
     detail = {"on_behalf": False, "hit_context": ctx}
-    if auto:
-        detail.update(auto_hit=True, rule_id=rule["rule_id"], bid_id=bid["bid_id"],
+    if auto and bid:
+        detail.update(auto_hit=True, bid_id=bid["bid_id"],
                       bid_basis_cents=bid["basis_cents"], bid_cash_price=bid["cash_price"],
                       bid_flat_price=bid.get("flat_price"), flat_source=bid.get("flat_source"),
                       futures_quote=bid.get("quote_price"))        # the live flat bid the offer was compared with
@@ -732,106 +735,35 @@ def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, rule: dic
     _notify(db, tenant_id, "offer_hit", offer_id, auto=auto)
 
 
-# ── Auto-hit rules ─────────────────────────────────────────────────────────────
-def _auto_rules(db: Db, tenant_id: str) -> list[dict]:
-    return db.query("SELECT * FROM auto_hit_rules WHERE tenant_id = %s AND active ORDER BY rule_id", (tenant_id,))
-
-
-def _matching_rule(offer: dict, bid: dict, rules: list[dict]) -> dict | None:
-    loc = offer["location_id"] if offer.get("location_id") is not None else bid.get("location_id")
-    for r in rules:
-        if r["location_id"] is not None and r["location_id"] != loc:
-            continue
-        if r["grain"] and r["grain"] != offer["grain"]:
-            continue
-        if r["contract_type"] and r["contract_type"] != offer["contract_type"]:
-            continue
-        if r["max_bushels"] is not None and offer["bushels"] > r["max_bushels"]:
-            continue
-        return r
-    return None
-
-
-def _auto_hit_one(db: Db, tenant_id: str, offer: dict, bids: list[dict], rules: list[dict]) -> bool:
-    """Hit this offer if it is outstanding, the live bid has reached it, and an active rule allows it."""
-    if not rules or offer["status"] != "submitted" or offer["contract_type"] == "FUTURES_ONLY":
+# ── Filling working offers ─────────────────────────────────────────────────────
+def _fill_if_reached(db: Db, tenant_id: str, offer: dict, bids: list[dict]) -> bool:
+    """Fill this offer if it is WORKING (accepted) and the live bid has reached it. Futures-only offers have no bid to
+    reach, so staff fill those by hand."""
+    if offer["status"] != "working" or offer["contract_type"] == "FUTURES_ONLY":
         return False
     bid = _reference_bid(offer, bids)
     if not bid_reached(offer, bid):
         return False
-    rule = _matching_rule(offer, bid, rules)
-    if rule is None:
-        return False
-    _mark_hit(db, tenant_id, offer["offer_id"], rule=rule, bid=bid)
+    _mark_hit(db, tenant_id, offer["offer_id"], auto=True, bid=bid)
     return True
 
 
 def run_auto_hit(db: Db, tenant_id: str) -> int:
-    """Check every outstanding offer against the live bids and the tenant's active auto-hit rules.
-    Safe to call any time (idempotent). Runs when a bid is posted, an offer is entered, a rule is
-    added or switched on, and from the admin's 'check now' button. Returns how many offers it hit."""
-    expire_stale(db, tenant_id)                                  # a lapsed offer is expired, never hit
-    rules = _auto_rules(db, tenant_id)
-    if not rules:
+    """Move every working offer the live bid has reached to Filled. Safe to call any time (idempotent). Runs when a bid is
+    posted, an offer is accepted, and after each futures refresh. Returns how many offers it filled."""
+    expire_stale(db, tenant_id)                                  # a lapsed offer is expired, never filled
+    rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'working'", (tenant_id,))
+    if not rows:
         return 0
     bids = list_bids(db, tenant_id)
-    return sum(_auto_hit_one(db, tenant_id, o, bids, rules)
-               for o in db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'submitted'", (tenant_id,)))
-
-
-def list_auto_hit_rules(db: Db, tenant_id: str, admin_id: int) -> list[dict]:
-    _require_admin(db, tenant_id, admin_id)
-    return db.query("SELECT * FROM auto_hit_rules WHERE tenant_id = %s ORDER BY rule_id", (tenant_id,))
-
-
-def add_auto_hit_rule(db: Db, tenant_id: str, admin_id: int, *, location_id=None, grain=None,
-                      contract_type=None, max_bushels=None) -> int:
-    """Admin adds a rule and it is applied at once. Returns how many outstanding offers it hit."""
-    _require_admin(db, tenant_id, admin_id)
-    if grain and grain not in CONTRACT_BUSHELS:
-        raise PortalError("Unknown commodity.")
-    if contract_type and contract_type not in ("CASH", "HTA"):
-        raise PortalError("Auto-hit applies to cash and HTA offers (futures-only offers have no bid to reach).")
-    if location_id is not None and not db.query(
-            "SELECT 1 AS x FROM locations WHERE location_id = %s AND tenant_id = %s", (location_id, tenant_id)):
-        raise PortalError("Unknown location.")
-    if max_bushels is not None and max_bushels <= 0:
-        raise PortalError("The bushel limit must be positive (leave it blank for no limit).")
-    _insert(db, "auto_hit_rules", dict(tenant_id=tenant_id, location_id=location_id, grain=grain or None,
-                                       contract_type=contract_type or None, max_bushels=max_bushels,
-                                       created_by=admin_id))
-    _audit(db, tenant_id, admin_id, "auto_hit_rule_added", dict(location_id=location_id, grain=grain,
-                                                                contract_type=contract_type, max_bushels=max_bushels))
-    return run_auto_hit(db, tenant_id)
-
-
-def set_auto_hit_rule_active(db: Db, tenant_id: str, admin_id: int, rule_id: int, active: bool) -> int:
-    _require_admin(db, tenant_id, admin_id)
-    if not db.query("SELECT 1 AS x FROM auto_hit_rules WHERE rule_id = %s AND tenant_id = %s", (rule_id, tenant_id)):
-        raise PortalError("Rule not found for this tenant.")
-    db.execute("UPDATE auto_hit_rules SET active = %s WHERE rule_id = %s AND tenant_id = %s",
-               (active, rule_id, tenant_id))
-    _audit(db, tenant_id, admin_id, "auto_hit_rule_on" if active else "auto_hit_rule_off", dict(rule_id=rule_id))
-    return run_auto_hit(db, tenant_id) if active else 0
-
-
-def check_auto_hit_now(db: Db, tenant_id: str, admin_id: int) -> int:
-    _require_admin(db, tenant_id, admin_id)
-    return run_auto_hit(db, tenant_id)
-
-
-def list_auto_hits(db: Db, tenant_id: str, admin_id: int, limit: int = 25) -> list[dict]:
-    """Recent offers hit automatically, newest first."""
-    _require_admin(db, tenant_id, admin_id)
-    viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
-    rows = [o for o in list_offers(db, tenant_id, viewer) if o["auto_hit"]]
-    rows.sort(key=lambda o: str(o["hit_at"]), reverse=True)
-    return rows[:limit]
+    return sum(_fill_if_reached(db, tenant_id, o, bids) for o in rows)
 
 
 def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
                  on_behalf: bool = False) -> str:
-    """hit | decline | withdraw. Returns the new status. There are no counter-offers.
+    """accept | hit | decline | withdraw. Returns the new status. There are no counter-offers.
+
+    accept: staff take an offer on to work (it becomes "working"); if the bid is already at its price it fills at once.
 
     on_behalf=True: elevator staff record a farmer's withdrawal (phone call, in person). The
     event log keeps the staff user as actor and flags it.
@@ -863,9 +795,13 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
     db.execute("UPDATE offers SET status = %s, updated_at = CURRENT_TIMESTAMP() "
                "WHERE offer_id = %s AND tenant_id = %s", (new_status, offer_id, tenant_id))
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=user["user_id"],
-                                     event_type=new_status, detail={"on_behalf": on_behalf}),
-            ("detail",))
+                                     event_type="accepted" if new_status == "working" else new_status,
+                                     detail={"on_behalf": on_behalf}), ("detail",))
     _notify(db, tenant_id, "offer_" + new_status, offer_id, on_behalf=on_behalf)
+    if new_status == "working":                                       # already at its price? it fills now
+        o = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
+        if _fill_if_reached(db, tenant_id, o, list_bids(db, tenant_id)):
+            return "hit"
     return new_status
 
 
@@ -949,6 +885,32 @@ def complete_offer(db: Db, tenant_id: str, staff_id: int, offer_id: int, contrac
     _notify(db, tenant_id, "offer_completed", offer_id)
 
 
+def confirm_purchase(db: Db, tenant_id: str, staff_id: int, offer_id: int, contract_ref: str) -> None:
+    """Confirm Purchase on a FILLED offer: the elevator takes the grain on (it is added to today's purchases) and, with the
+    contract number (required), the offer is completed. One step; the contract number is checked first so a missing one
+    leaves the offer untouched. (A legacy 'confirmed' offer still waiting for its number just completes.)"""
+    _require_staff(db, tenant_id, staff_id)
+    _, ref = _clean_details(None, contract_ref)
+    if not ref:
+        raise PortalError("Enter the contract number to confirm this purchase.")
+    r = db.query("SELECT status FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))
+    if not r:
+        raise PortalError("Offer not found for this tenant.")
+    if r[0]["status"] == "hit":
+        acknowledge_offer(db, tenant_id, staff_id, offer_id)
+    elif r[0]["status"] != "acknowledged":
+        raise PortalError("Only a filled offer can be confirmed.")
+    complete_offer(db, tenant_id, staff_id, offer_id, ref)
+
+
+def ct_date(v) -> date | None:
+    """The Central-time calendar day of a stored timestamp (a datetime, or the 'YYYY-MM-DD HH:MM:SS' UTC text), else None."""
+    if not v:
+        return None
+    from .auth import _as_utc
+    return _as_utc(v).astimezone(CT).date()
+
+
 def cancel_offer(db: Db, tenant_id: str, actor_id: int, offer_id: int, reason: str) -> None:
     """Amend an offer to CANCELLED after it was hit. Staff can cancel a hit or acknowledged offer; a completed one
     needs an admin. A reason is required. Admins are notified and the offer sits on the Hedge page's
@@ -1013,7 +975,7 @@ def mark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> 
     n = 0
     for oid in offer_ids:
         r = db.query("SELECT status, hedged_at FROM offers WHERE offer_id = %s AND tenant_id = %s", (oid, tenant_id))
-        if not r or r[0]["status"] not in HELD or r[0]["hedged_at"] is not None:
+        if not r or r[0]["status"] not in HEDGEABLE or r[0]["hedged_at"] is not None:
             continue
         db.execute("UPDATE offers SET hedged_at = CURRENT_TIMESTAMP(), hedged_by = %s WHERE offer_id = %s "
                    "AND tenant_id = %s", (admin_id, oid, tenant_id))
@@ -1029,7 +991,7 @@ def unmark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -
     n = 0
     for oid in offer_ids:
         r = db.query("SELECT status, hedged_at FROM offers WHERE offer_id = %s AND tenant_id = %s", (oid, tenant_id))
-        if not r or r[0]["status"] not in HELD or r[0]["hedged_at"] is None:
+        if not r or r[0]["status"] not in HEDGEABLE or r[0]["hedged_at"] is None:
             continue
         db.execute("UPDATE offers SET hedged_at = NULL, hedged_by = NULL WHERE offer_id = %s AND tenant_id = %s",
                    (oid, tenant_id))
@@ -1044,7 +1006,7 @@ def _contains(hay, needle) -> bool:
 
 
 def offer_summary(db: Db, tenant_id: str, staff_id: int, *, grains=None, periods=None, entity="",
-                  individual="", statuses=("submitted", "hit", "acknowledged")) -> dict:
+                  individual="", statuses=("submitted", "working", "hit", "acknowledged")) -> dict:
     """Offers grouped by commodity and delivery period, after filtering. Staff only.
     Returns {"groups": [...], "offers": [...]} — groups carry counts, bushels and weighted averages."""
     _require_staff(db, tenant_id, staff_id)
@@ -1095,9 +1057,9 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     _require_admin(db, tenant_id, admin_id)
     viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
     offers = list_offers(db, tenant_id, viewer)
-    now = [o for o in offers if o["status"] in HELD and o["hedged_at"] is None]
-    hedged = [o for o in offers if o["status"] in HELD and o["hedged_at"] is not None]
-    potential = [o for o in offers if o["status"] == "submitted"]
+    now = [o for o in offers if o["status"] in HEDGEABLE and o["hedged_at"] is None]
+    hedged = [o for o in offers if o["status"] in HEDGEABLE and o["hedged_at"] is not None]
+    potential = [o for o in offers if o["status"] in ("submitted", "working")]
 
     def build(rows):
         buckets: dict = {}

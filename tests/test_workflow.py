@@ -53,13 +53,13 @@ def test_only_a_hit_offer_can_be_acknowledged_and_only_by_staff_of_the_tenant(db
 
 def test_an_offer_hit_automatically_also_waits_for_acknowledgement(db):
     data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", basis_cents=-38, cash_price=4.50)
-    data.add_auto_hit_rule(db, "rcm", 2)
     oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+    assert _st(db, oid)["status"] == "submitted"                         # nothing fills an offer nobody has accepted
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "hit"      # accepted at a price the bid already reached
     assert _st(db, oid)["status"] == "hit" and _st(db, oid)["auto_hit"]
     with pytest.raises(PortalError):
         data.complete_offer(db, "rcm", 2, oid, "C-1")                   # automation never skips the human steps
-    data.acknowledge_offer(db, "rcm", 2, oid)
-    data.complete_offer(db, "rcm", 2, oid, "C-1")
+    data.confirm_purchase(db, "rcm", 2, oid, "C-1")                     # Confirm Purchase with the contract number
 
 
 # ── cancel after a hit -> admin hedge adjustment ─────────────────────────────
@@ -144,7 +144,7 @@ def test_acknowledged_offers_still_count_as_to_hedge_until_marked_hedged(db):
 def test_staff_acknowledge_then_cancel_from_the_offer_cards(app_db):
     oid = _hit(app_db)
     at = _as(app_db, 2)
-    stage(at, "Hit")
+    stage(at, "Filled Offers")
     assert not at.exception, at.exception
     assert any("Cancel this offer" == e.label for e in at.expander)
     next(t for t in at.text_input if t.label.startswith("Reason (required)")).set_value("Farmer sold elsewhere")
@@ -160,7 +160,7 @@ def test_staff_acknowledge_then_cancel_from_the_offer_cards(app_db):
 def test_cancel_without_a_reason_is_refused_on_screen(app_db):
     _hit(app_db)
     at = _as(app_db, 2)
-    stage(at, "Hit")
+    stage(at, "Filled Offers")
     next(b for b in at.button if b.label == "Cancel offer").click().run()
     assert at.error and "reason" in at.error[0].value.lower()
 
