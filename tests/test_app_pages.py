@@ -97,17 +97,24 @@ def test_hedge_page_shows_contracts_and_marks_offers_hedged(app_db):
     oid = _hit_offer(app_db)
     data.create_offer(app_db, "rcm", conftest.user(app_db, 1), **{**FLAT, "bushels": 10000, "price": 4.60})
     at = _go(_as(app_db, 2), "Hedge")
-    assert len(at.dataframe) >= 4                                                          # now + potential, 2 tables each
+    assert len(at.dataframe) >= 5                                                          # position + now + potential tables
     assert any("implied futures" in c.value for c in at.caption)
-    now_totals = at.dataframe[0].value
+    position = at.dataframe[0].value
+    assert list(position["Hit (contracts)"]) == [1.0] and list(position["Still to hedge (contracts)"]) == [1.0]
+    assert list(position["Hedge acknowledged (contracts)"]) == [0.0]
+    now_totals = at.dataframe[1].value
     assert list(now_totals["Contracts"]) == [1.0] and list(now_totals["Bushels"]) == [5000]
-    {m.label: m for m in at.multiselect}["Hit offers not yet hedged"].select(
+    {m.label: m for m in at.multiselect}["Hit offers: choose the ones whose hedge is on"].select(
         data.hedge_summary(app_db, "rcm", 2)["now_offers"][0]).run()
-    next(b for b in at.button if b.label == "Mark selected as hedged").click().run()
+    ack = lambda: next(b for b in at.button if b.label.startswith("Acknowledge hedge"))
+    assert ack().disabled                                                                  # nothing happens until they confirm
+    next(c for c in at.checkbox if c.label.startswith("I have confirmed these hedges")).check().run()
+    ack().click().run()
     assert not at.exception, at.exception
     assert [o["hedged_at"] is not None for o in data.list_offers(app_db, "rcm", conftest.user(app_db, 2))
             if o["offer_id"] == oid] == [True]
-    assert any("No hit offers are waiting" in i.value for i in at.info)
+    assert any("hedge has been acknowledged" in i.value for i in at.info)
+    assert list(at.dataframe[0].value["Hedge acknowledged (contracts)"]) == [1.0]          # now counted as covered
 
 
 def test_posting_a_bid_reports_how_many_flat_offers_were_repriced(app_db):

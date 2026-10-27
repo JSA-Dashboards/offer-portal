@@ -297,3 +297,44 @@ def test_every_returned_id_is_the_row_that_was_just_written(db):
     assert [got[oid] for oid in ids] == [1000 + i for i in range(25)]      # each id points at its own offer
     ev = {r["offer_id"] for r in db.query("SELECT offer_id FROM offer_events WHERE event_type = 'submitted'")}
     assert set(ids) <= ev
+
+
+# ── hedge acknowledgement: covered once, never twice ─────────────────────────
+def test_hedge_position_separates_what_is_hedged_from_what_is_still_to_hedge(db):
+    _bid(db)
+    bid = _live_bid(db)
+    mk = lambda bu: data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "bushels": bu}, bid_id=bid)
+    a, b, c = mk(5000), mk(10000), mk(5000)
+    for o in (a, b, c):
+        data.act_on_offer(db, "rcm", user(db, 2), o, "hit")
+    pos = lambda: data.hedge_summary(db, "rcm", 2)["position"][0]
+    assert (pos()["hit_contracts"], pos()["hedged_contracts"], pos()["todo_contracts"]) == (4.0, 0.0, 4.0)
+    assert data.mark_hedged(db, "rcm", 2, [a, b]) == 2
+    assert (pos()["hit_contracts"], pos()["hedged_contracts"], pos()["todo_contracts"], pos()["todo_offers"]) == (4.0, 3.0, 1.0, 1)
+    h = data.hedge_summary(db, "rcm", 2)
+    assert [o["offer_id"] for o in h["now_offers"]] == [c]                       # only the unhedged one is left to do
+    assert sorted(o["offer_id"] for o in h["hedged_offers"]) == sorted([a, b])
+    assert {o["hedged_by"] for o in h["hedged_offers"]} == {2}                      # who acknowledged it is recorded
+    assert data.mark_hedged(db, "rcm", 2, [a, b]) == 0                            # acknowledging twice changes nothing
+    assert pos()["hedged_contracts"] == 3.0
+
+
+def test_a_hedge_acknowledged_by_mistake_can_be_taken_back_and_it_is_logged(db):
+    _bid(db)
+    oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=_live_bid(db))
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "hit")
+    data.mark_hedged(db, "rcm", 2, [oid])
+    with pytest.raises(PortalError):
+        data.unmark_hedged(db, "rcm", 1, [oid])                                   # a farmer can't
+    assert data.unmark_hedged(db, "rcm", 2, [oid]) == 1
+    assert data.unmark_hedged(db, "rcm", 2, [oid]) == 0                           # nothing left to take back
+    assert [o["offer_id"] for o in data.hedge_summary(db, "rcm", 2)["now_offers"]] == [oid]
+    kinds = [e["event_type"] for e in db.query("SELECT event_type FROM offer_events WHERE offer_id = %s ORDER BY event_id", (oid,))]
+    assert kinds[-2:] == ["hedged", "hedge_undone"]
+
+
+def test_only_hit_offers_can_have_a_hedge_acknowledged(db):
+    _bid(db)
+    oid = data.create_offer(db, "rcm", user(db, 1), **FLAT, bid_id=_live_bid(db))
+    assert data.mark_hedged(db, "rcm", 2, [oid]) == 0                              # still outstanding: nothing to hedge yet
+    assert data.hedge_summary(db, "rcm", 2)["position"] == []

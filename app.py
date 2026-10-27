@@ -615,7 +615,9 @@ def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
         if data.bid_gap(o):
             line.append(data.bid_gap(o))
         if staff and o.get("hedged_at"):
-            line.append("hedged")
+            line.append("hedge acknowledged")
+        elif staff and o["status"] in data.HELD:
+            line.append("hedge not yet acknowledged")
         st.markdown(_md(f"**{_terms(o)}**{who}  \n:grey[{' · '.join(line)}]"))
         if staff and o.get("bid_reached"):
             st.markdown(":green[:material/bolt: The posted bid has reached this offer. Mark it hit when you fill it.]")
@@ -1274,17 +1276,54 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
                 if st.button("Hedge adjusted", key=f"hadj_{o['offer_id']}"):
                     data.mark_hedge_adjusted(db, tenant_id, user["user_id"], [o["offer_id"]])
                     _refresh()
-    st.subheader("Hit offers: hedge now")
+    st.subheader("Hit offers: acknowledge the hedge")
+    st.caption("A hit offer means the elevator owns the grain and its hedge should go on. When a hedge is on (or already "
+               "was), acknowledge it here: the offer leaves the to-hedge list and moves to Hedges acknowledged, so the "
+               "same offer is never hedged twice. The table shows, for each futures month, what is hit, what is already "
+               "acknowledged as hedged, and what is still to hedge.")
+    if h["position"]:
+        st.dataframe([{"Commodity": p["grain"], "Futures month": f"{p['futures_month']} ({p['futures_symbol']})",
+                       "Hit (contracts)": p["hit_contracts"], "Hedge acknowledged (contracts)": p["hedged_contracts"],
+                       "Still to hedge (contracts)": p["todo_contracts"], "Still to hedge (bu)": p["todo_bushels"],
+                       "Offers still to hedge": p["todo_offers"]} for p in h["position"]],
+                     hide_index=True, width="stretch",
+                     column_config={"Still to hedge (bu)": st.column_config.NumberColumn(format="%d")})
     if not h["now"]:
-        st.info("No hit offers are waiting to be hedged.")
+        st.info("Every hit offer's hedge has been acknowledged." if h["position"] else "No hit offers right now.")
     else:
         _hedge_tables(h["now_totals"], h["now"], quotes, key="now")
-        with st.expander("Mark offers as hedged"):
-            picks = st.multiselect("Hit offers not yet hedged", h["now_offers"], key="hedge_pick",
-                                   format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
-                                                         f"{o['futures_symbol']} · {o['price_type'].lower()} offer")
-            if st.button("Mark selected as hedged", key="hedge_go", disabled=not picks):
-                data.mark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in picks])
+        picks = st.multiselect("Hit offers: choose the ones whose hedge is on", h["now_offers"], key="hedge_pick",
+                               format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
+                                                     f"{o['futures_symbol']} · {o['price_type'].lower()} offer")
+        months = {f"{t['grain']} · {t['futures_month']} ({t['futures_symbol']})": (t["grain"], t["futures_symbol"])
+                  for t in h["now_totals"]}
+        whole = st.selectbox("…or every hit offer in one futures month", [""] + list(months), key="hedge_month",
+                             format_func=lambda m: "—" if not m else m)
+        chosen = list(picks)
+        if whole:
+            chosen += [o for o in h["now_offers"] if (o["grain"], o["futures_symbol"]) == months[whole] and o not in chosen]
+        sure = st.checkbox("I have confirmed these hedges are on in our account, so none will be placed twice.",
+                           key="hedge_sure")
+        bu = sum(o["bushels"] for o in chosen)
+        if st.button(f"Acknowledge hedge ({len(chosen)} offer{'s' if len(chosen) != 1 else ''}, {bu:,} bu)",
+                     key="hedge_go", type="primary", disabled=not (chosen and sure)):
+            data.mark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in chosen])
+            st.session_state.pop("hedge_sure", None)
+            _refresh()
+    if h["hedged_offers"]:
+        with st.expander(f"Hedges acknowledged ({len(h['hedged_offers'])})"):
+            st.dataframe([{"Farmer": o.get("farmer_name") or "", "Bushels": o["bushels"], "Commodity": o["grain"],
+                           "Futures month": o["futures_symbol"], "Acknowledged": str(o["hedged_at"])[:16],
+                           "By": o.get("hedged_by_name") or o.get("hedged_by_email") or "",
+                           "Offer status": data.STATUS_LABELS.get(o["status"], o["status"]),
+                           "Contract #": o.get("contract_ref") or ""} for o in h["hedged_offers"]],
+                         hide_index=True, width="stretch",
+                         column_config={"Bushels": st.column_config.NumberColumn(format="%d")})
+            undo = st.multiselect("Acknowledged by mistake? Put offers back on the to-hedge list", h["hedged_offers"],
+                                  key="hedge_undo", format_func=lambda o: f"{o['farmer_name']} · {o['bushels']:,} bu {o['grain']} "
+                                                                           f"{o['futures_symbol']}")
+            if st.button("Put back on the to-hedge list", key="hedge_undo_go", disabled=not undo):
+                data.unmark_hedged(db, tenant_id, user["user_id"], [o["offer_id"] for o in undo])
                 _refresh()
     st.subheader("Outstanding offers: if they are hit")
     if not h["potential"]:

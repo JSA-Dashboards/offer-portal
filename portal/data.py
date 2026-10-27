@@ -620,11 +620,13 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
            "f.individual_name AS farmer_individual, "
            "pb.name AS placed_by_name, pb.email AS placed_by_email, "
            "ab.name AS acknowledged_by_name, ab.email AS acknowledged_by_email, "
-           "cb.name AS cancelled_by_name, cb.email AS cancelled_by_email FROM offers o "
+           "cb.name AS cancelled_by_name, cb.email AS cancelled_by_email, "
+           "hb.name AS hedged_by_name, hb.email AS hedged_by_email FROM offers o "
            "LEFT JOIN farmers f ON f.farmer_id = o.farmer_id "
            "LEFT JOIN users pb ON pb.user_id = o.placed_by "
            "LEFT JOIN users ab ON ab.user_id = o.acknowledged_by "
-           "LEFT JOIN users cb ON cb.user_id = o.cancelled_by WHERE o.tenant_id = %s")
+           "LEFT JOIN users cb ON cb.user_id = o.cancelled_by "
+           "LEFT JOIN users hb ON hb.user_id = o.hedged_by WHERE o.tenant_id = %s")
     params: list = [tenant_id]
     if user["role"] == "farmer":
         sql += " AND f.user_id = %s"
@@ -1002,6 +1004,22 @@ def mark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> 
     return n
 
 
+def unmark_hedged(db: Db, tenant_id: str, admin_id: int, offer_ids: list[int]) -> int:
+    """Take back a hedge acknowledgement made by mistake: the offer goes back on the "still to hedge" list."""
+    _require_admin(db, tenant_id, admin_id)
+    n = 0
+    for oid in offer_ids:
+        r = db.query("SELECT status, hedged_at FROM offers WHERE offer_id = %s AND tenant_id = %s", (oid, tenant_id))
+        if not r or r[0]["status"] not in HELD or r[0]["hedged_at"] is None:
+            continue
+        db.execute("UPDATE offers SET hedged_at = NULL, hedged_by = NULL WHERE offer_id = %s AND tenant_id = %s",
+                   (oid, tenant_id))
+        _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=oid, actor_user_id=admin_id,
+                                         event_type="hedge_undone", detail={}), ("detail",))
+        n += 1
+    return n
+
+
 def _contains(hay, needle) -> bool:
     return not needle or needle.strip().lower() in (hay or "").lower()
 
@@ -1059,6 +1077,7 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     viewer = {"role": "elevator_admin", "user_id": admin_id, "tenant_id": tenant_id}
     offers = list_offers(db, tenant_id, viewer)
     now = [o for o in offers if o["status"] in HELD and o["hedged_at"] is None]
+    hedged = [o for o in offers if o["status"] in HELD and o["hedged_at"] is not None]
     potential = [o for o in offers if o["status"] == "submitted"]
 
     def build(rows):
@@ -1101,7 +1120,33 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
     pot_lines, pot_totals = build(potential)
     return dict(now=now_lines, now_totals=now_totals, now_offers=now,
                 potential=pot_lines, potential_totals=pot_totals,
+                hedged_offers=sorted(hedged, key=lambda o: str(o["hedged_at"]), reverse=True),
+                position=hedge_position(now + hedged),
                 adjustments=hedge_adjustments(db, tenant_id, admin_id))
+
+
+def hedge_position(held: list[dict]) -> list[dict]:
+    """For every futures month with hit offers: how much is hit, how much of that has its hedge acknowledged, and how
+    much is still to hedge. Reading these side by side is what stops one hit offer being hedged twice."""
+    rows: dict = {}
+    for o in held:
+        key = (o["grain"], o["futures_symbol"])
+        r = rows.setdefault(key, dict(grain=o["grain"], futures_symbol=o["futures_symbol"],
+                                      futures_month=contracts.futures_label(o["futures_symbol"]),
+                                      exchange=(contracts.SPECS.get(contracts.canon_grain(o["grain"])) or {}).get("exchange", ""),
+                                      hit_bushels=0, hedged_bushels=0, todo_bushels=0, hit_offers=0, todo_offers=0))
+        r["hit_bushels"] += o["bushels"]
+        r["hit_offers"] += 1
+        if o["hedged_at"] is None:
+            r["todo_bushels"] += o["bushels"]
+            r["todo_offers"] += 1
+        else:
+            r["hedged_bushels"] += o["bushels"]
+    for r in rows.values():
+        size = CONTRACT_BUSHELS.get(r["grain"], 5000)
+        for k in ("hit", "hedged", "todo"):
+            r[f"{k}_contracts"] = round(r[f"{k}_bushels"] / size, 2)
+    return sorted(rows.values(), key=lambda r: (_grain_rank(r["grain"]), contracts.sort_key(r["futures_symbol"])))
 
 
 # ── Housekeeping: no price archive ───────────────────────────────────────────────
