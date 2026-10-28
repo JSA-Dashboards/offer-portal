@@ -67,16 +67,28 @@ def _market_label(choice: str) -> str:
     return f"{g} · {contracts.futures_label(s)} ({s})"
 
 
-def _tab_pages(labels: list[str], key: str, default: str | None = None):
+def _tab_pages(labels: list[str], key: str, names: dict | None = None):
     """Tab pages that only run the open tab: yields each label whose tab is selected, inside that tab.
-    (A plain st.tabs runs every tab on every click; with on_change="rerun" only the selected one is computed.)"""
-    seen = f"_tab_{key}"                                          # the open tab survives reruns and role switches
-    default = default or st.session_state.get(seen)
-    tabs = st.tabs(labels, key=key, on_change="rerun", default=default if default in labels else None)
+    (A plain st.tabs runs every tab on every click; with on_change="rerun" only the selected one is computed.)
+
+    `names` maps a label to a stable name when the labels carry changing text (the offer stages show live counts): the open
+    tab is remembered by that name, so a count changing keeps you where you were.
+
+    The `default` handed to st.tabs must NOT change from one run to the next: a changed default makes Streamlit treat the
+    widget as new and restart it on that default, which threw away the tab you had just clicked. So it is worked out only
+    when the set of labels changes or the group comes back after being off screen (a new widget either way) and is held constant
+    until then."""
+    names = names or {l: l for l in labels}
+    sig, remembered = f"_sig_{key}", f"_tab_{key}"
+    if st.session_state.get(sig) != tuple(labels) or key not in st.session_state:       # a new (or returning) widget
+        was = st.session_state.get(remembered)
+        st.session_state[f"_def_{key}"] = next((l for l in labels if names[l] == was), None)
+        st.session_state[sig] = tuple(labels)
+    tabs = st.tabs(labels, key=key, on_change="rerun", default=st.session_state.get(f"_def_{key}"))
     for label, tab in zip(labels, tabs):
         with tab:
             if tab.open:
-                st.session_state[seen] = label
+                st.session_state[remembered] = names[label]
                 yield label
 
 
@@ -814,9 +826,7 @@ def offers_view(db, tenant_id: str, user: dict, staff: bool) -> None:
     today = data.today_ct()
     counts = {k: sum(1 for o in rows if _in_stage(o, k, today)) for k in STAGES}
     names = {f"{k} ({counts[k]})": k for k in STAGES}          # the counts change, so remember the stage by its name
-    remembered = st.session_state.get("offers_stage")
-    for label in _tab_pages(list(names), key="offers_tabs", default=next((l for l, k in names.items() if k == remembered), None)):
-        st.session_state["offers_stage"] = names[label]
+    for label in _tab_pages(list(names), key="offers_tabs", names=names):
         _offers_stage(db, tenant_id, user, staff, rows, names[label])
 
 

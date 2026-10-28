@@ -85,6 +85,17 @@ def user(db, uid):
 _SUBTABS = ("Tenants", "Usage Report", "JSA Admins")
 
 
+def _reopen(at, key, name):
+    """Make the tab group `key` start on `name` at the next run: the page picks a tab group's default only when its labels
+    change, so clear what it has remembered about this group and say which tab to open."""
+    for prefix in ("_sig_", "_def_"):
+        if prefix + key in at.session_state:
+            del at.session_state[prefix + key]
+    at.session_state["_tab_" + key] = name
+    if key in at.session_state:
+        del at.session_state[key]
+
+
 def pages(at):
     """The main page tabs the signed-in user sees (not the offer-stage or platform sub-tabs)."""
     return [t.label for t in at.tabs if " (" not in t.label and t.label not in _SUBTABS]
@@ -93,16 +104,14 @@ def pages(at):
 def goto(at, page):
     """Open a page: select its tab (the tab group's key holds the open tab's label) and rerun."""
     key = next(k for k in at.session_state.filtered_state if k.startswith("main_tabs"))
-    at.session_state["_tab_" + key] = page
-    del at.session_state[key]
+    _reopen(at, key, page)
     return at.run()
 
 
 def stage(at, name):
     """Open an offers stage tab ('Hit', 'Closed', ...): tab labels carry live counts, so match on the name."""
     assert any(t.label.startswith(name + " (") for t in at.tabs), name
-    at.session_state["offers_stage"] = name                 # the page remembers the open stage by name (the counts change)
-    del at.session_state["offers_tabs"]
+    _reopen(at, "offers_tabs", name)                        # the page remembers the open stage by name (the counts change)
     return at.run()
 
 
