@@ -41,6 +41,7 @@ st.set_page_config(page_title="JSA Offer Portal Management", page_icon=str(_ICON
 def get_db():
     db = connect()
     db.actor_ttl = 15          # a page makes several role checks: reuse each for a few seconds (see data._actor)
+    db.read_ttl = 10           # the same bids / offers / quotes are read on every click: reuse them (Db.cached; any write clears)
     return db
 
 
@@ -1536,7 +1537,10 @@ def main() -> None:
             sms_settings(db, user, tenant)
         if auth.passwords_ready(db) and not user.get("_preview"):
             with st.expander("Password"):
-                if password_form(db, real or user, "change_pw", current_needed=auth.has_password(db, user["user_id"])):
+                if password_form(db, real or user, "change_pw",
+                                 current_needed=_kept(f"_k_haspw_{user['user_id']}", 300,
+                                                      lambda: auth.has_password(db, user["user_id"]))):
+                    st.session_state.pop(f"_k_haspw_{user['user_id']}", None)
                     st.success("Password saved.")
         if st.button("Sign out"):
             for k in ("user", "tenant_id", "login_step", "pw_offer"):

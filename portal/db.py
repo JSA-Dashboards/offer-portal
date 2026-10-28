@@ -8,8 +8,10 @@ Snowflake a one-class change (swap `connect()` for the session connection).
 """
 from __future__ import annotations
 
+import copy
 import os
 import pathlib
+import time
 
 PROJ = pathlib.Path(__file__).resolve().parent.parent
 
@@ -35,6 +37,9 @@ class Db:
         self.conn = conn
         self.dialect = dialect                      # 'snowflake' | 'sqlite'
         self._reconnect = reconnect                 # opens a fresh connection (Snowflake sessions expire when idle)
+        self.read_ttl = 0                           # seconds a cached read is reused (the app sets this; 0 = never cache)
+        self._reads: dict = {}
+        self._writes = 0                            # bumped by every write: a cached read never outlives a change
         self.json_fn = "PARSE_JSON(%s)" if dialect == "snowflake" else "%s"
 
     def _sql(self, sql: str) -> str:
@@ -77,7 +82,26 @@ class Db:
             return [dict(zip(cols, r)) for r in cur.fetchall()]
         return self._with_cursor(work)
 
+    def cached(self, key, fn, ttl: float | None = None):
+        """fn()'s result, reused for `ttl` seconds (default read_ttl) unless anything has been written since. Every tab click
+        reruns the page and the same lists (bids, offers, quotes) are read again and again at ~0.1-0.3 s a round trip. Writes
+        through this object (any session of this app) drop the cache at once; changes made by another process (the droplet's
+        jobs) show up within the ttl. Callers get their own copy, so changing a returned row never alters the cache."""
+        ttl = self.read_ttl if ttl is None else ttl
+        if not ttl:
+            return fn()
+        hit = self._reads.get(key)
+        if hit and hit[2] == self._writes and time.monotonic() - hit[0] < ttl:
+            return copy.deepcopy(hit[1])
+        written = self._writes
+        val = fn()
+        if len(self._reads) > 400:
+            self._reads.clear()
+        self._reads[key] = (time.monotonic(), copy.deepcopy(val), written)
+        return val
+
     def execute(self, sql: str, params: tuple = ()) -> None:
+        self._writes += 1
         self._with_cursor(lambda cur: cur.execute(self._sql(sql), params))
         if self.dialect == "sqlite":
             self.conn.commit()

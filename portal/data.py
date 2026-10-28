@@ -125,7 +125,8 @@ def get_tenant(db: Db, tenant_id: str) -> dict | None:
 
 
 def list_locations(db: Db, tenant_id: str) -> list[dict]:
-    return db.query("SELECT * FROM locations WHERE tenant_id = %s AND active ORDER BY name", (tenant_id,))
+    return db.cached(("locations", tenant_id), lambda: db.query(
+        "SELECT * FROM locations WHERE tenant_id = %s AND active ORDER BY name", (tenant_id,)))
 
 
 def get_user_by_email(db: Db, email: str) -> dict | None:
@@ -171,10 +172,9 @@ def list_bids(db: Db, tenant_id: str, grain: str | None = None) -> list[dict]:
     if grain:
         sql += " AND grain = %s"
         params.append(grain)
-    rows = db.query(sql + " ORDER BY grain, delivery_month", tuple(params))
+    rows = db.cached(("bids", tenant_id, grain), lambda: db.query(sql + " ORDER BY grain, delivery_month", tuple(params)))
     syms = {b["futures_symbol"] for b in rows if b["futures_symbol"]}
-    quotes = ({q["symbol"]: q for q in db.query("SELECT symbol, price, as_of, fetched_at FROM futures_quotes")
-               if q["symbol"] in syms} if syms else {})
+    quotes = ({s: q for s, q in _quotes_by_symbol(db).items() if s in syms} if syms else {})
     for b in rows:
         q = quotes.get(b["futures_symbol"])
         b["flat_price"], b["flat_source"] = live_flat(b, q)
@@ -481,7 +481,8 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
 
 
 def _quotes_by_symbol(db: Db) -> dict[str, dict]:
-    return {q["symbol"]: q for q in db.query("SELECT symbol, price, as_of, fetched_at FROM futures_quotes")}
+    rows = db.cached("quotes", lambda: db.query("SELECT symbol, price, as_of, fetched_at FROM futures_quotes"))
+    return {q["symbol"]: q for q in rows}
 
 
 def futures_reached(offer: dict, quote: dict | None) -> bool:
@@ -652,7 +653,8 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
     if status:
         sql += " AND o.status = %s"
         params.append(status)
-    rows = db.query(sql + " ORDER BY o.created_at DESC", tuple(params))
+    rows = db.cached(("offers", tenant_id, user["role"] == "farmer" and user["user_id"], status),
+                     lambda: db.query(sql + " ORDER BY o.created_at DESC", tuple(params)))
     bids = list_bids(db, tenant_id)
     quotes = _quotes_by_symbol(db) if any(o["contract_type"] == "FUTURES_ONLY" and o["status"] in ("submitted", "working")
                                           for o in rows) else {}

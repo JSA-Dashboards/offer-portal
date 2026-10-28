@@ -84,3 +84,50 @@ def test_role_checks_are_reused_briefly_but_misses_and_changes_are_not_stuck(db)
         data._require_admin(db, "rcm", 2)
     finally:
         Db.query = real
+
+
+# ── cached reads: reused between clicks, dropped by any write ────────────────
+def test_cached_reads_are_reused_until_a_write_and_callers_get_their_own_copy(db):
+    calls = []
+
+    def read():
+        calls.append(1)
+        return db.query("SELECT user_id, role FROM users ORDER BY user_id")
+
+    assert db.cached("k", read) == db.query("SELECT user_id, role FROM users ORDER BY user_id") and len(calls) == 1
+    db.read_ttl = 60
+    a = db.cached("k", read)
+    b = db.cached("k", read)
+    assert len(calls) == 2 and a == b                                       # the second call came from the cache
+    a[0]["role"] = "tampered"
+    assert db.cached("k", read)[0]["role"] != "tampered"                    # changing a returned row cannot poison the cache
+    db.execute("UPDATE users SET role = 'farmer' WHERE user_id = 2")        # any write drops every cached read
+    assert [r["role"] for r in db.cached("k", read) if r["user_id"] == 2] == ["farmer"] and len(calls) == 3
+
+
+def test_a_cached_read_expires_and_the_cache_is_off_unless_asked_for(db):
+    n = []
+    db.read_ttl = 0.05
+    f = lambda: n.append(1) or [len(n)]
+    assert db.cached("t", f) == [1] and db.cached("t", f) == [1]
+    import time
+    time.sleep(0.08)
+    assert db.cached("t", f) == [2]                                         # past the ttl: read again
+    db.read_ttl = 0
+    assert db.cached("t", f) == [3] and db.cached("t", f) == [4]            # off: always reads
+
+
+def test_the_lists_the_pages_share_follow_changes_made_through_the_app(db):
+    from portal import data
+    db.read_ttl = 60
+    data.publish_bid(db, "rcm", 2, grain="Corn", delivery_month="2999-12", basis_cents=-38, futures_symbol="ZCZ26")
+    assert len(data.list_bids(db, "rcm")) == 1 and len(data.list_bids(db, "rcm")) == 1
+    data.publish_bid(db, "rcm", 2, grain="Soybeans", delivery_month="2999-12", basis_cents=-50, futures_symbol="ZSX26")
+    assert len(data.list_bids(db, "rcm")) == 2                                # a new bid shows at once
+    from conftest import user
+    oid = data.create_offer(db, "rcm", user(db, 1), grain="Corn", contract_type="HTA",
+                            price_type="BASIS", bushels=5000, basis_cents=-30, futures_symbol="ZCZ26")
+    staff = user(db, 2)
+    assert [o["status"] for o in data.list_offers(db, "rcm", staff)] == ["submitted"]
+    data.act_on_offer(db, "rcm", staff, oid, "accept")
+    assert [o["status"] for o in data.list_offers(db, "rcm", staff)] == ["working"]      # and so does a status change
