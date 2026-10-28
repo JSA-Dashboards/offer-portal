@@ -167,7 +167,7 @@ CREATE TABLE IF NOT EXISTS bids (
 );
 
 -- ── Offers ──────────────────────────────────────────────────────────────────
--- contract_type: CASH | HTA | FUTURES_ONLY
+-- contract_type: CASH (futures price + basis) | FUTURES_ONLY (a futures price: hedge-to-arrive) | BASIS (a basis only)
 -- price_type:    FIXED | BASIS          (a basis offer needs futures_symbol)
 -- status: submitted (outstanding) -> hit -> acknowledged -> completed (archived)
 --         or declined | withdrawn | expired (before a hit), or cancelled (after a hit).   No counter-offers.
@@ -240,7 +240,7 @@ CREATE TABLE IF NOT EXISTS auto_hit_rules (
     tenant_id      STRING       NOT NULL,
     location_id    NUMBER(38,0),
     grain          STRING,
-    contract_type  STRING,                          -- CASH | HTA (futures-only offers have no bid to reach)
+    contract_type  STRING,                          -- CASH | FUTURES_ONLY | BASIS
     max_bushels    NUMBER(38,0),
     active         BOOLEAN      NOT NULL DEFAULT TRUE,
     created_by     NUMBER(38,0),

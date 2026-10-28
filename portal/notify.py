@@ -103,8 +103,11 @@ def farmer_recipient(db: Db, tenant_id: str, farmer_id) -> dict | None:
 
 # ── content ─────────────────────────────────────────────────────────────────────
 def _terms_text(o: dict) -> str:
-    px = f"${o['price']:.2f}/bu" if o["price_type"] == "FIXED" else f"{o['basis_cents']:+d}¢ on {o['futures_symbol']}"
-    return f"{o['bushels']:,} bu {o['grain']} · {o['contract_type']} · {px} · {o['futures_symbol']}"
+    from .data import CONTRACT_LABELS, LEGACY_CONTRACTS
+    ct = LEGACY_CONTRACTS.get(o["contract_type"], o["contract_type"])
+    px = (f"{o['basis_cents']:+d}¢ basis" if o["price_type"] != "FIXED" else
+          f"futures ${o['price']:.2f}" if ct == "FUTURES_ONLY" else f"${o['price']:.2f}/bu")
+    return f"{o['bushels']:,} bu {o['grain']} · {CONTRACT_LABELS.get(ct, ct)} · {px} · {o['futures_symbol']}"
 
 
 def _offer_table(o: dict) -> str:

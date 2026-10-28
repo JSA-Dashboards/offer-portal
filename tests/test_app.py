@@ -3,7 +3,7 @@ import sqlite3
 import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
-from portal import auth, data
+from portal import auth, contracts, data
 from portal.db import Db
 import conftest
 
@@ -97,23 +97,50 @@ def test_farmer_makes_offer(app_db):
     goto(at, "Make an Offer")
     assert not at.exception, at.exception
     send = lambda: next(b for b in at.button if b.label == "Send offer")
-    send().click().run()                                   # open price: no delivery period, no futures month yet
-    assert at.error and "delivery period" in at.error[0].value.lower()           # the delivery period sets when it expires
+    num = lambda label: next(n for n in at.number_input if n.label == label)
+    send().click().run()                                   # open price, Cash by default: it needs a futures price and a basis
+    assert at.error and "futures price and a basis" in at.error[0].value
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 1)) == []
-    # Against a posted bid the delivery period (and symbol, basis) come from the bid, so it can be sent as it is.
+    assert not [d for d in at.date_input if d.label.startswith("Delivery")]        # no delivery window: the futures month is the choice
+    # Futures Only (HTA): the basis is greyed out; the futures month alone sets the delivery period.
+    at.session_state["ctype_open_0"] = "FUTURES_ONLY"
+    at.run()
+    assert num("Basis (¢)").disabled and not num("Futures price ($/bu)").disabled
+    num("Futures price ($/bu)").set_value(4.55)
+    send().click().run()
+    assert not at.error, [e.value for e in at.error]
+    o = data.list_offers(app_db, "rcm", conftest.user(app_db, 1))[0]
+    sym = contracts.options("Corn")[0]
+    assert (o["contract_type"], o["price"], o["basis_cents"], o["futures_symbol"]) == ("FUTURES_ONLY", 4.55, None, sym)
+    assert str(o["delivery_start"]) == contracts.calendar_month(sym) + "-01"                # the futures month, no window typed
+    # Basis Only: the futures price is greyed out.
+    at = _as(app_db, 1)
+    goto(at, "Make an Offer")
+    at.session_state["ctype_open_0"] = "BASIS"
+    at.run()
+    assert num("Futures price ($/bu)").disabled and not num("Basis (¢)").disabled
+    num("Basis (¢)").set_value(-30)
+    send().click().run()
+    assert not at.error, [e.value for e in at.error]
+    assert {x["contract_type"] for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 1))} == {"FUTURES_ONLY", "BASIS"}
+    # Against a posted bid the symbol, basis and delivery window come from the bid; Cash = futures price + basis.
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-30, cash_price=4.2)
     at = _as(app_db, 1)
     goto(at, "Make an Offer")
-    at.session_state["offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]                       # pick the bid (AppTest cannot drive a
+    bid_id = data.list_bids(app_db, "rcm")[0]["bid_id"]
+    at.session_state["offer_bid"] = bid_id                                                           # pick the bid (AppTest cannot drive a
     at.run()                                                                                         # selectbox that has a format_func)
     assert not at.exception, at.exception
-    assert [str(d.value) for d in at.date_input[:2]] == ["2999-12-01", "2999-12-31"]      # prefilled from the bid
+    assert num("Basis (¢)").value == -30                                                            # prefilled from the bid
+    num("Futures price ($/bu)").set_value(4.60)
+    at.run()
+    assert any("Flat price: $4.3000/bu" in c.value for c in at.caption)                              # 4.60 - 0.30, shown live
     send().click().run()
     assert not at.error, [e.value for e in at.error]
-    offer = data.list_offers(app_db, "rcm", conftest.user(app_db, 1))[0]
-    assert (offer["futures_symbol"], offer["basis_cents"], offer["status"]) == ("ZCZ26", -30, "submitted")
-    assert str(offer["delivery_end"]) == "2999-12-31"
+    offer = [x for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 1)) if x["contract_type"] == "CASH"][0]
+    assert (offer["futures_symbol"], offer["basis_cents"], offer["price"], offer["status"]) == ("ZCZ26", -30, 4.3, "submitted")
+    assert offer["implied_futures"] == 4.6 and str(data.offer_delivery_end(offer)) == "2999-12-31"
 
 
 def test_farmer_view_is_read_only_board(app_db):

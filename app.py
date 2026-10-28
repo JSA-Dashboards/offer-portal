@@ -500,15 +500,21 @@ def suggestions_view(db, tenant_id: str, user: dict) -> None:
                 _refresh()
 
 
-CONTRACT_LABELS = {"CASH": "Cash (deliver and price)", "HTA": "HTA (hedge-to-arrive)",
-                   "FUTURES_ONLY": "Futures only"}
+CONTRACT_LABELS = data.CONTRACT_LABELS
 OPEN = "Open price (my own number)"
 
 
 def _terms(o: dict) -> str:
-    px = f"${o['price']:.2f}/bu" if o["price_type"] == "FIXED" else \
-        f"{o['basis_cents']:+d}¢ on {o['futures_symbol']}"
-    return f"{o['bushels']:,} bu {o['grain']} · {o['contract_type']} · {px}"
+    ct = data.LEGACY_CONTRACTS.get(o["contract_type"], o["contract_type"])
+    if o["price_type"] != "FIXED":
+        px = f"{o['basis_cents']:+d}¢ basis on {o['futures_symbol']}"
+    elif ct == "FUTURES_ONLY":
+        px = f"futures ${o['price']:.4f} on {o['futures_symbol']}"
+    elif o.get("basis_cents") is not None and o.get("implied_futures") is not None:       # cash with its own split
+        px = f"${o['price']:.2f}/bu (futures {o['implied_futures']:.4f} {o['basis_cents']:+d}¢ basis)"
+    else:
+        px = f"${o['price']:.2f}/bu"
+    return f"{o['bushels']:,} bu {o['grain']} · {CONTRACT_LABELS.get(ct, ct)} · {px}"
 
 
 def _expiry(d: date | None):
@@ -517,7 +523,11 @@ def _expiry(d: date | None):
 
 @st.fragment
 def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) -> None:
-    """farmer_id=None: a farmer submits their own offer. Otherwise staff place it for that farmer."""
+    """farmer_id=None: a farmer submits their own offer. Otherwise staff place it for that farmer.
+
+    The contract type drives the form: Cash takes a futures price and a basis (the flat price is their sum), Futures Only (HTA)
+    only a futures price (the basis is greyed out), Basis Only only a basis (the futures price is greyed out). An offer names a
+    futures month, not a delivery window."""
     tid = tenant["tenant_id"]
     kp = f"f{farmer_id}_" if farmer_id else ""
     locs = _loc_names(db, tid)
@@ -528,8 +538,8 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
         st.info("This elevator isn't taking offers right now.")
         return
     if st.session_state.pop("offer_sent", False):
-        st.success("Offer entered. Find it under Offers." if farmer_id else
-                   "Offer sent. You can follow it under My offers.")
+        st.success("Offer entered. Find it under Working Offers." if farmer_id else
+                   "Offer sent. You can follow it under My Offers.")
 
     def label(i):
         b = by_id.get(i)
@@ -539,62 +549,70 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
                                           else f"${b['cash_price']:.2f}"))
     sel = st.selectbox("Make an offer against", choices, format_func=label, key=f"{kp}offer_bid")
     bid = by_id.get(sel)
-    # Everything below keys on the chosen bid so switching bids resets the defaults.
-    k = bid["bid_id"] if bid else "open"
-    with st.form(f"{kp}offer_form_{k}", clear_on_submit=True):
-        c1, c2, c3 = st.columns(3)
-        if bid:
-            grain, fut = bid["grain"], bid["futures_symbol"]
-            c1.text_input("Commodity and futures month", f"{grain} · {contracts.futures_label(fut)} ({fut})", disabled=True)
-        else:
-            grain, fut = c1.selectbox("Commodity and futures month", _markets(), format_func=_market_label).split("|")
-        contract = c2.selectbox("Contract type", list(data.CONTRACT_TYPES),
-                                format_func=CONTRACT_LABELS.get)
-        bushels = c3.number_input("Bushels", min_value=0, step=1000, value=5000, format="%d")
-        c4, c5 = st.columns(2)
-        ptype = c4.segmented_control("Price type", list(data.PRICE_TYPES), default="BASIS")
-        basis = c5.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d")
-        price = st.number_input("Fixed price ($/bu) — for fixed-price offers",
-                                value=bid["cash_price"] if bid else None, step=0.01, format="%.2f")
-        c7, c8, c9 = st.columns(3)
-        start = c7.date_input("Delivery from (first day)", value=bid["window_start"] if bid else None,
-                              key=f"{kp}dfrom_{k}")
-        end = c8.date_input("Delivery to (last day: the offer expires after it)", value=bid["window_end"] if bid else None,
-                            key=f"{kp}dto_{k}")
-        good = c9.date_input("Offer good until", value=None, min_value=date.today(),
-                             help="Leave blank and the offer stays good through the last day of the delivery period "
-                                  "(it expires the next day). Pick an earlier date to end it sooner.")
-        contract_ref = st.text_input("Contract reference # (optional)", max_chars=60)
-        note = st.text_area("Notes" if farmer_id else "Notes to the elevator", max_chars=500)
-        if st.form_submit_button("Enter offer" if farmer_id else "Send offer", type="primary"):
-            if user.get("_preview") and user["role"] == "farmer":
-                st.warning("You are previewing as a farmer: offers can't be sent from here.")
-                return
-            if bool(start) != bool(end) or (not bid and not (start and end)):
-                st.error("Enter the delivery period (first and last day). The offer expires the day after the last day.")
-                return
-            if start and end and end < start:
-                st.error("The delivery period ends before it starts.")
-                return
-            terms = dict(
-                grain=grain, contract_type=contract, price_type=ptype or "BASIS",
-                bushels=int(bushels), price=price if ptype == "FIXED" else None,
-                basis_cents=basis if ptype != "FIXED" else None,
-                futures_symbol=fut, bid_id=bid["bid_id"] if bid else None,
-                location_id=bid["location_id"] if bid else None,
-                delivery_start=start.isoformat() if start else None,
-                delivery_end=end.isoformat() if end else None, note=note or None,
-                contract_ref=contract_ref or None,
-                expires_at=_expiry(good))
-            try:
-                if farmer_id:
-                    data.place_offer_for_farmer(db, tid, user["user_id"], farmer_id, **terms)
-                else:
-                    data.create_offer(db, tid, user, **terms)
-                st.session_state["offer_sent"] = True
-                _refresh()
-            except data.PortalError as e:
-                st.error(str(e))
+    # Every widget below is keyed on the chosen bid, the contract type and a send counter, so changing any of them (or
+    # sending an offer) starts the fields afresh with the right defaults.
+    ver = st.session_state.get(f"{kp}offer_ver", 0)
+    k = f"{kp}{bid['bid_id'] if bid else 'open'}_{ver}"
+    contract = st.radio("Contract type", list(data.CONTRACT_TYPES), format_func=CONTRACT_LABELS.get, horizontal=True,
+                        key=f"{kp}ctype_{k}")
+    c1, c2 = st.columns(2)
+    if bid:
+        grain, fut = bid["grain"], bid["futures_symbol"]
+        c1.text_input("Commodity and futures month", f"{grain} · {contracts.futures_label(fut)} ({fut})", disabled=True,
+                      key=f"{kp}fixed_{k}")
+    else:
+        grain, fut = c1.selectbox("Commodity and futures month", _markets(), format_func=_market_label,
+                                  key=f"{kp}mkt_{k}").split("|")
+    bushels = c2.number_input("Bushels", min_value=0, step=1000, value=5000, format="%d", key=f"{kp}bu_{k}")
+    quote = data._quotes_by_symbol(db).get(fut) if _may_see_futures(tenant, user) else None
+    live_fut = round(float(quote["price"]), 4) if quote and data._quote_fresh(quote) else None
+    c3, c4 = st.columns(2)
+    futures_price = c3.number_input("Futures price ($/bu)", value=live_fut, step=0.01, format="%.4f",
+                                    disabled=contract == "BASIS", key=f"{kp}fp_{k}_{contract}",
+                                    help="Greyed out for Basis Only: the futures price is set later.")
+    basis = c4.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d",
+                            disabled=contract == "FUTURES_ONLY", key=f"{kp}bs_{k}_{contract}",
+                            help="Greyed out for Futures Only (HTA): the basis is set later.")
+    if contract == "CASH" and futures_price is not None and basis is not None:
+        st.caption(f"Flat price: ${futures_price + basis / 100:.4f}/bu (futures price plus basis).")
+    if bid and bid.get("window_start") and bid.get("window_end"):
+        st.caption(f"Delivery: {bid['window_start']:%b %d} – {bid['window_end']:%b %d, %Y}, from the bid. "
+                   f"The offer is good through the last day.")
+    else:
+        st.caption(f"Delivery: {contracts.futures_label(fut)}, the futures month. The offer is good through the last day of it.")
+    c5, c6 = st.columns(2)
+    good = c5.date_input("Offer good until", value=None, min_value=date.today(), key=f"{kp}good_{k}",
+                         help="Leave blank and the offer stays good through the last day of its delivery period "
+                              "(it expires the next day). Pick an earlier date to end it sooner.")
+    contract_ref = c6.text_input("Contract reference # (optional)", max_chars=60, key=f"{kp}ref_{k}")
+    note = st.text_area("Notes" if farmer_id else "Notes to the elevator", max_chars=500, key=f"{kp}note_{k}")
+    if st.button("Enter offer" if farmer_id else "Send offer", type="primary", key=f"{kp}send_{k}"):
+        if user.get("_preview") and user["role"] == "farmer":
+            st.warning("You are previewing as a farmer: offers can't be sent from here.")
+            return
+        need = {"CASH": futures_price is not None and basis is not None, "FUTURES_ONLY": futures_price is not None,
+                "BASIS": basis is not None}[contract]
+        if not need:
+            st.error({"CASH": "A cash offer needs a futures price and a basis.", "FUTURES_ONLY": "Enter the futures price.",
+                      "BASIS": "Enter the basis."}[contract])
+            return
+        terms = dict(
+            grain=grain, contract_type=contract, bushels=int(bushels),
+            futures_price=futures_price if contract != "BASIS" else None,
+            basis_cents=int(basis) if contract != "FUTURES_ONLY" else None,
+            futures_symbol=fut, bid_id=bid["bid_id"] if bid else None,
+            location_id=bid["location_id"] if bid else None,
+            note=note or None, contract_ref=contract_ref or None, expires_at=_expiry(good))
+        try:
+            if farmer_id:
+                data.place_offer_for_farmer(db, tid, user["user_id"], farmer_id, **terms)
+            else:
+                data.create_offer(db, tid, user, **terms)
+            st.session_state["offer_sent"] = True
+            st.session_state[f"{kp}offer_ver"] = ver + 1
+            _refresh()
+        except data.PortalError as e:
+            st.error(str(e))
 
 
 def _offer_card(db, tenant_id: str, user: dict, o: dict, staff: bool) -> None:
@@ -1234,7 +1252,7 @@ def summary_view(db, tenant_id: str, user: dict) -> None:
 def _level_label(b: dict) -> str:
     if b["level"] is None:
         return "no basis reference"
-    return f"{int(b['level']):+d}¢ basis" if b["kind"] == "Basis (HTA)" else f"{b['level']:.4f}"
+    return f"{int(b['level']):+d}¢ basis" if b["kind"] == "Basis only" else f"{b['level']:.4f}"
 
 
 def _hedge_tables(totals: list[dict], lines: list[dict], quotes: dict | None = None, key: str = "now") -> None:
@@ -1353,7 +1371,7 @@ def hedge_view(db, tenant_id: str, user: dict) -> None:
         _hedge_tables(h["potential_totals"], h["potential"], quotes, key="potential")
     st.caption("Contracts = bushels divided by the contract size (5,000 bu for corn, soybeans and wheat). "
                "Flat-price offers show the implied futures price (flat price less the posted basis), and it moves "
-               "when the basis does. Basis (HTA) offers have no futures price yet, so they show their basis.")
+               "when the basis does. Basis Only offers have no futures price yet, so they show their basis.")
 
 
 @st.fragment

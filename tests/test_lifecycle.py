@@ -85,11 +85,13 @@ def test_open_priced_flat_offer_follows_the_bid_for_its_futures_and_delivery_mon
     no_dates = data.create_offer(db, "rcm", user(db, 1), **FLAT)
     o = _offers(db)
     assert o[match]["implied_futures"] == 4.68 and o[match]["bid_id"] is None
-    assert all(o[x]["implied_futures"] is None for x in (wrong_month, wrong_symbol, no_dates))   # nothing prices them yet
-    assert _bid(db, basis=-30) == 1
+    assert all(o[x]["implied_futures"] is None for x in (wrong_month, wrong_symbol))              # nothing prices them yet
+    assert o[no_dates]["implied_futures"] == 4.68                                                 # no dates: its futures month (Dec) is its delivery month
+    assert _bid(db, basis=-30) == 2
     o = _offers(db)
     assert o[match]["implied_futures"] == 4.60 and o[match]["basis_ref_cents"] == -30
-    assert all(o[x]["implied_futures"] is None for x in (wrong_month, wrong_symbol, no_dates))
+    assert o[no_dates]["implied_futures"] == 4.60
+    assert all(o[x]["implied_futures"] is None for x in (wrong_month, wrong_symbol))
     _bid(db, basis=-25, delivery_month="2027-01")                                # a bid for the later month prices that one
     assert _offers(db)[wrong_month]["implied_futures"] == 4.55
 
@@ -224,7 +226,7 @@ def test_hedge_summary_counts_contracts_by_futures_month_and_price_level(db):
     ladder = {(b["kind"], b["level"]): (b["offers"], b["bushels"], b["contracts"]) for b in h["now"]}
     assert ladder == {("Flat price", 4.68): (2, 12500, 2.5), ("Flat price", 4.78): (1, 5000, 1.0)}   # implied futures levels
     pot = {(b["kind"], b["level"]): b["bushels"] for b in h["potential"]}
-    assert pot == {("Basis (HTA)", -30): 10000, ("Flat price", 4.98): 5000}
+    assert pot == {("Basis only", -30): 10000, ("Flat price", 4.98): 5000}
     assert h["potential_totals"][0]["contracts"] == 3.0
 
 

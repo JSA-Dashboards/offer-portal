@@ -80,7 +80,15 @@ def test_offer_validation(db):
 
     with pytest.raises(PortalError):
 
-        data.create_offer(db, "rcm", f, **{**OFFER, "price_type": "FIXED"})
+        data.create_offer(db, "rcm", f, **{**OFFER, "basis_cents": None})                 # basis only needs a basis
+
+    with pytest.raises(PortalError):
+
+        data.create_offer(db, "rcm", f, **{**OFFER, "contract_type": "FUTURES_ONLY", "basis_cents": None})   # needs a futures price
+
+    with pytest.raises(PortalError):
+
+        data.create_offer(db, "rcm", f, **{**OFFER, "contract_type": "CASH", "basis_cents": -30})            # cash needs both prices
 
 
 

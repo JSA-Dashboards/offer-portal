@@ -206,9 +206,17 @@ def test_outstanding_offers_show_when_they_expire_and_the_bid_board_shows_the_wi
     assert list(at.dataframe[0].value["Delivery window"]) == ["Dec 01 – Dec 20, 2999"]
 
 
-def test_the_offer_form_requires_a_delivery_period_when_there_is_no_bid(app_db):
+def test_the_offer_form_needs_its_prices_not_a_delivery_window(app_db):
     at = _as(app_db, 1)
     goto(at, "Make an Offer")
     next(b for b in at.button if b.label == "Send offer").click().run()
-    assert at.error and "delivery period" in at.error[0].value.lower()
+    assert at.error and "futures price and a basis" in at.error[0].value      # Cash is the default contract type
     assert data.list_offers(app_db, "rcm", user(app_db, 1)) == []
+
+
+def test_an_open_priced_offer_runs_through_its_futures_month_and_expires_the_day_after(db):
+    oid = data.create_offer(db, "rcm", user(db, 1), grain="Corn", contract_type="FUTURES_ONLY", bushels=5000,
+                            futures_price=4.55, futures_symbol="ZCZ99")
+    o = [x for x in data.list_offers(db, "rcm", user(db, 2)) if x["offer_id"] == oid][0]
+    assert (str(o["delivery_start"]), str(o["delivery_end"])) == ("2099-12-01", "2099-12-31")
+    assert str(data.offer_delivery_end(o)) == "2099-12-31"

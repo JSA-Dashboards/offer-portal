@@ -19,7 +19,9 @@ from .db import Db
 
 CT = ZoneInfo("America/Chicago")          # Cloud hosts run UTC; business dates are Central
 
-CONTRACT_TYPES = ("CASH", "HTA", "FUTURES_ONLY")
+CONTRACT_TYPES = ("CASH", "FUTURES_ONLY", "BASIS")
+CONTRACT_LABELS = {"CASH": "Cash", "FUTURES_ONLY": "Futures Only (HTA)", "BASIS": "Basis Only"}
+LEGACY_CONTRACTS = {"HTA": "BASIS"}      # the first build called a basis offer "HTA"; a hedge-to-arrive is the futures-only one
 PRICE_TYPES = ("FIXED", "BASIS")
 ROLES = ("platform_admin", "elevator_admin", "elevator_staff", "farmer")
 ELEVATOR_ROLES = ("elevator_admin", "elevator_staff")
@@ -455,7 +457,7 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
         return 0
     n = 0
     rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status IN ('submitted', 'working') AND price_type = 'FIXED' "
-                    "AND contract_type <> 'FUTURES_ONLY'", (tenant_id,))
+                    "AND contract_type <> 'FUTURES_ONLY' AND basis_cents IS NULL", (tenant_id,))      # own basis entered: not re-priced
     for o in rows:
         linked = o["bid_id"] is not None and (o["bid_id"] in old_ids or o["bid_id"] == bid["bid_id"])
         if not linked and _reference_bid(o, [bid]) is None:
@@ -562,22 +564,43 @@ def ensure_farmer_for_user(db: Db, tenant_id: str, user: dict) -> int:
 
 
 def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by, actor_id: int, *,
-               grain: str, contract_type: str, price_type: str, bushels: int, price=None,
-               basis_cents=None, futures_symbol=None, bid_id=None, location_id=None,
+               grain: str, contract_type: str, bushels: int, price_type: str | None = None, price=None,
+               futures_price=None, basis_cents=None, futures_symbol=None, bid_id=None, location_id=None,
                delivery_start=None, delivery_end=None, note=None, contract_ref=None,
                expires_at=None) -> int:
+    """The contract type decides what the offer is made of:
+      CASH          a futures price AND a basis: the flat price is their sum (a flat `price` alone is still accepted)
+      FUTURES_ONLY  a futures price only (a hedge-to-arrive: the basis is set later)
+      BASIS         a basis only (the futures price is set later)
+    Offers name a futures month, not a delivery window: against a bid they carry the bid's window, otherwise the
+    calendar month of the futures month."""
+    contract_type = LEGACY_CONTRACTS.get(contract_type, contract_type)
     if contract_type not in CONTRACT_TYPES:
         raise PortalError(f"contract_type must be one of {CONTRACT_TYPES}")
+    price_type = price_type or ("BASIS" if contract_type == "BASIS" else "FIXED")
     if price_type not in PRICE_TYPES:
         raise PortalError(f"price_type must be one of {PRICE_TYPES}")
     if bushels <= 0:
         raise PortalError("Bushels must be positive.")
-    if price_type == "FIXED" and price is None:
-        raise PortalError("A fixed-price offer needs a price.")
+    own_terms = False                                    # True: the offer carries its own futures price and basis
+    if contract_type == "BASIS":
+        price_type, price = "BASIS", None
+        if basis_cents is None:
+            raise PortalError("A basis-only offer needs a basis.")
+    elif contract_type == "FUTURES_ONLY":
+        price_type, price, basis_cents = "FIXED", (futures_price if futures_price is not None else price), None
+        if price is None:
+            raise PortalError("A futures-only offer needs a futures price.")
+    else:
+        price_type = "FIXED"
+        if futures_price is not None and basis_cents is not None:
+            price, own_terms = round(float(futures_price) + basis_cents / 100.0, 4), True
+        elif price is None:
+            raise PortalError("A cash offer needs a futures price and a basis.")
+        else:
+            basis_cents = None                           # a flat price alone: the basis is the posted bid's
     grain = contracts.canon_grain(grain)
     futures_symbol = _futures_month(grain, futures_symbol)
-    if price_type == "BASIS" and basis_cents is None:
-        raise PortalError("A basis offer needs a basis and a futures symbol.")
     note, contract_ref = _clean_details(note, contract_ref)
     snapshot = None
     if bid_id is not None:
@@ -589,6 +612,9 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         t = get_tenant(db, tenant_id)
         if not t or not t["open_pricing"]:
             raise PortalError("This elevator only accepts offers against posted bids.")
+    if snapshot is None and delivery_start is None and delivery_end is None:   # open-priced: runs through the futures month
+        first, last = month_bounds(contracts.calendar_month(futures_symbol))
+        delivery_start, delivery_end = first.isoformat(), last.isoformat()
     end = offer_delivery_end(dict(delivery_end=delivery_end, delivery_start=delivery_start, bid_snapshot=snapshot))
     if end is not None and end < today_ct():
         raise PortalError("That delivery period has already ended.")
@@ -596,6 +622,8 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
                               delivery_start=delivery_start), list_bids(db, tenant_id))
     ref_basis = ref["basis_cents"] if (ref and price_type == "FIXED") else None
     imp = implied_futures(dict(price_type=price_type, price=price, contract_type=contract_type), ref_basis)
+    if own_terms:                                        # the farmer's own split: futures price and basis as entered
+        ref_basis, imp = basis_cents, round(float(futures_price), 4)
     oid = new_id()
     _insert(db, "offers", dict(
         offer_id=oid, basis_ref_cents=ref_basis, implied_futures=imp,
@@ -659,6 +687,7 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
     quotes = _quotes_by_symbol(db) if any(o["contract_type"] == "FUTURES_ONLY" and o["status"] in ("submitted", "working")
                                           for o in rows) else {}
     for o in rows:
+        o["contract_type"] = LEGACY_CONTRACTS.get(o["contract_type"], o["contract_type"])
         o["delivery_period"] = delivery_period(o)
         if o["status"] not in ("submitted", "working"):
             o["bid_reached"] = False
@@ -1102,9 +1131,9 @@ def hedge_summary(db: Db, tenant_id: str, admin_id: int) -> dict:
         buckets: dict = {}
         for o in rows:
             if o["price_type"] == "BASIS":
-                kind, level = "Basis (HTA)", o["basis_cents"]
+                kind, level = "Basis only", o["basis_cents"]
             elif o["contract_type"] == "FUTURES_ONLY":
-                kind, level = "Futures only", o["implied_futures"]
+                kind, level = "Futures only (HTA)", o["implied_futures"]
             else:
                 kind, level = "Flat price", o["implied_futures"]
             key = (o["grain"], o["futures_symbol"], kind, level)

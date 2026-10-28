@@ -179,7 +179,8 @@ def record_from_offer(db: Db, tenant_id: str, offer_id: int, staff_id: int) -> i
     loc = o.get("location_id") if o.get("location_id") is not None else (snap or {}).get("location_id")
     period = delivery_period(o)
     fixed = o["price_type"] == "FIXED"
-    kind = {"CASH": "cash", "HTA": "HTA", "FUTURES_ONLY": "futures-only"}.get(o["contract_type"], o["contract_type"])
+    kind = {"CASH": "cash", "BASIS": "basis only", "HTA": "basis only", "FUTURES_ONLY": "futures only (HTA)"}.get(
+        o["contract_type"], o["contract_type"])
     return add_purchase(
         db, tenant_id, staff_id, grain=o["grain"], bushels=o["bushels"], farmer_id=o["farmer_id"],
         price=o["price"] if fixed else None,

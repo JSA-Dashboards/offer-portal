@@ -7,6 +7,10 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
 - **Bids:** staff post a bid board; scrapers (AgriCharts, Bushel) stage suggestions that an admin confirms.
   Posting a new bid replaces the live one for that slot and re-prices outstanding flat-price offers
   (flat price - basis = implied futures).
+- **Contract types** (they decide what an offer is made of): **Cash** = a futures price plus a basis (the flat price is their sum),
+  **Futures Only (HTA)** = a futures price (the basis is greyed out and set later), **Basis Only** = a basis (the futures price is
+  greyed out and set later). An offer names a **futures month**, not a delivery window: against a bid it carries the bid's window,
+  otherwise it runs through that futures month.
 - **Offers:** farmers (or staff on their behalf) make offers. Flow: **Outstanding** (entered, not accepted) -> staff press
   **Accept Offer** -> **Working Offers** (accepted, price not reached) -> the bid reaches the price and the offer moves to
   **Filled Offers** by itself -> staff press **Confirm Purchase** with the contract number (required) -> **Completed** (today)

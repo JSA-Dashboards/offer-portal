@@ -57,6 +57,12 @@ def check_symbol(grain: str, symbol: str | None) -> str:
     return s
 
 
+def calendar_month(symbol: str | None) -> str | None:
+    """'ZCZ26' -> '2026-12': the calendar month a futures month stands for (an offer on it runs through that month)."""
+    p = parse_symbol(symbol)
+    return f"{p[2]}-{_MONTH_CODE[p[1]]:02d}" if p else None
+
+
 def futures_label(symbol: str | None) -> str:
     """'ZCZ26' -> 'Dec 2026'; anything unparseable comes back as given."""
     p = parse_symbol(symbol)
