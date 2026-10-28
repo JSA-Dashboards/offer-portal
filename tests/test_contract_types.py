@@ -1,4 +1,4 @@
-"""Contract type drives the offer: Cash (futures price + basis), Futures Only (HTA) (futures price), Basis Only (basis)."""
+"""Contract type drives the offer: Cash (a flat price; the futures level is backed out), Futures Only (HTA) (a futures price), Basis Only (a basis)."""
 import pytest
 
 from portal import data
@@ -22,18 +22,21 @@ def test_the_three_contract_types_and_their_labels():
     assert [data.CONTRACT_LABELS[c] for c in data.CONTRACT_TYPES] == ["Cash", "Futures Only (HTA)", "Basis Only"]
 
 
-def test_cash_is_a_futures_price_plus_a_basis(db):
-    bid = _bid(db)
-    oid = data.create_offer(db, "rcm", user(db, 1), **BASE, contract_type="CASH", futures_price=4.60, basis_cents=-30, bid_id=bid)
+def test_cash_is_a_flat_price_and_the_futures_level_to_hedge_is_backed_out_of_the_posted_basis(db):
+    bid = _bid(db, basis=-38)
+    oid = data.create_offer(db, "rcm", user(db, 1), **BASE, contract_type="CASH", price=4.30, bid_id=bid)
     o = _one(db, oid)
-    assert (o["contract_type"], o["price_type"], o["price"], o["basis_cents"]) == ("CASH", "FIXED", 4.30, -30)
-    assert (o["implied_futures"], o["basis_ref_cents"]) == (4.6, -30)                       # the farmer's own split
+    assert (o["contract_type"], o["price_type"], o["price"], o["basis_cents"]) == ("CASH", "FIXED", 4.30, None)
+    assert (o["implied_futures"], o["basis_ref_cents"]) == (4.68, -38)                      # 4.30 + .38: the futures level to hedge
     _bid(db, basis=-20)                                                                        # the posted basis moves...
-    assert (_one(db, oid)["implied_futures"], _one(db, oid)["price"]) == (4.6, 4.3)            # ...their terms do not
-    flat = data.create_offer(db, "rcm", user(db, 1), **BASE, contract_type="CASH", price=4.30, bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
-    assert _one(db, flat)["implied_futures"] == 4.5                                            # a flat price alone still follows the bid (4.30 + .20)
-    _bid(db, basis=-10)
-    assert _one(db, flat)["implied_futures"] == 4.4
+    assert (_one(db, oid)["implied_futures"], _one(db, oid)["price"]) == (4.5, 4.3)            # ...the hedge level follows, the flat price does not
+    h = data.hedge_summary(db, "rcm", 2)["potential"]
+    assert [(l["kind"], l["level"]) for l in h] == [("Flat price", 4.5)]                       # the Hedge page shows that level
+    with pytest.raises(PortalError):                                                           # the farmer's own futures price / basis are not offered
+        data.create_offer(db, "rcm", user(db, 1), **BASE, contract_type="CASH", futures_price=4.60, basis_cents=-30)
+    ignored = data.create_offer(db, "rcm", user(db, 1), **BASE, contract_type="CASH", price=4.30, basis_cents=-99, futures_price=9.9,
+                                bid_id=data.list_bids(db, "rcm")[0]["bid_id"])
+    assert (_one(db, ignored)["basis_cents"], _one(db, ignored)["implied_futures"]) == (None, 4.5)   # only the flat price counts
 
 
 def test_futures_only_keeps_just_the_futures_price_and_basis_only_just_the_basis(db):
@@ -77,7 +80,7 @@ def test_an_offer_names_a_futures_month_not_a_delivery_window(db):
 
 def test_the_hedge_page_names_the_contract_types(db):
     _bid(db)
-    for t in (dict(contract_type="CASH", futures_price=4.6, basis_cents=-30), dict(contract_type="FUTURES_ONLY", futures_price=4.5),
+    for t in (dict(contract_type="CASH", price=4.30), dict(contract_type="FUTURES_ONLY", futures_price=4.5),
               dict(contract_type="BASIS", basis_cents=-30)):
         data.create_offer(db, "rcm", user(db, 1), **BASE, **t)
     kinds = sorted(b["kind"] for b in data.hedge_summary(db, "rcm", 2)["potential"])

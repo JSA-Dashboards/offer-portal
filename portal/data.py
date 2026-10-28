@@ -457,7 +457,7 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
         return 0
     n = 0
     rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status IN ('submitted', 'working') AND price_type = 'FIXED' "
-                    "AND contract_type <> 'FUTURES_ONLY' AND basis_cents IS NULL", (tenant_id,))      # own basis entered: not re-priced
+                    "AND contract_type <> 'FUTURES_ONLY'", (tenant_id,))
     for o in rows:
         linked = o["bid_id"] is not None and (o["bid_id"] in old_ids or o["bid_id"] == bid["bid_id"])
         if not linked and _reference_bid(o, [bid]) is None:
@@ -569,7 +569,8 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
                delivery_start=None, delivery_end=None, note=None, contract_ref=None,
                expires_at=None) -> int:
     """The contract type decides what the offer is made of:
-      CASH          a futures price AND a basis: the flat price is their sum (a flat `price` alone is still accepted)
+      CASH          a flat price only. The futures level to hedge is backed out of it: flat price less the posted basis
+                    (implied futures), and it moves as the posted basis moves
       FUTURES_ONLY  a futures price only (a hedge-to-arrive: the basis is set later)
       BASIS         a basis only (the futures price is set later)
     Offers name a futures month, not a delivery window: against a bid they carry the bid's window, otherwise the
@@ -582,7 +583,6 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         raise PortalError(f"price_type must be one of {PRICE_TYPES}")
     if bushels <= 0:
         raise PortalError("Bushels must be positive.")
-    own_terms = False                                    # True: the offer carries its own futures price and basis
     if contract_type == "BASIS":
         price_type, price = "BASIS", None
         if basis_cents is None:
@@ -592,13 +592,9 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
         if price is None:
             raise PortalError("A futures-only offer needs a futures price.")
     else:
-        price_type = "FIXED"
-        if futures_price is not None and basis_cents is not None:
-            price, own_terms = round(float(futures_price) + basis_cents / 100.0, 4), True
-        elif price is None:
-            raise PortalError("A cash offer needs a futures price and a basis.")
-        else:
-            basis_cents = None                           # a flat price alone: the basis is the posted bid's
+        price_type, basis_cents = "FIXED", None          # the basis is the posted bid's, never the farmer's
+        if price is None:
+            raise PortalError("A cash offer needs a flat price.")
     grain = contracts.canon_grain(grain)
     futures_symbol = _futures_month(grain, futures_symbol)
     note, contract_ref = _clean_details(note, contract_ref)
@@ -622,8 +618,6 @@ def _new_offer(db: Db, tenant_id: str, farmer_id: int, farmer_user_id, placed_by
                               delivery_start=delivery_start), list_bids(db, tenant_id))
     ref_basis = ref["basis_cents"] if (ref and price_type == "FIXED") else None
     imp = implied_futures(dict(price_type=price_type, price=price, contract_type=contract_type), ref_basis)
-    if own_terms:                                        # the farmer's own split: futures price and basis as entered
-        ref_basis, imp = basis_cents, round(float(futures_price), 4)
     oid = new_id()
     _insert(db, "offers", dict(
         offer_id=oid, basis_ref_cents=ref_basis, implied_futures=imp,

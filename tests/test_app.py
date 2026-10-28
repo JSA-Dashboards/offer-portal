@@ -98,14 +98,14 @@ def test_farmer_makes_offer(app_db):
     assert not at.exception, at.exception
     send = lambda: next(b for b in at.button if b.label == "Send offer")
     num = lambda label: next(n for n in at.number_input if n.label == label)
-    send().click().run()                                   # open price, Cash by default: it needs a futures price and a basis
-    assert at.error and "futures price and a basis" in at.error[0].value
+    send().click().run()                                   # open price, Cash by default: it needs a flat price
+    assert at.error and "Enter the flat price" in at.error[0].value
     assert data.list_offers(app_db, "rcm", conftest.user(app_db, 1)) == []
     assert not [d for d in at.date_input if d.label.startswith("Delivery")]        # no delivery window: the futures month is the choice
     # Futures Only (HTA): the basis is greyed out; the futures month alone sets the delivery period.
     at.session_state["ctype_open_0"] = "FUTURES_ONLY"
     at.run()
-    assert num("Basis (¢)").disabled and not num("Futures price ($/bu)").disabled
+    assert num("Basis (¢)").disabled and num("Flat price ($/bu)").disabled and not num("Futures price ($/bu)").disabled
     num("Futures price ($/bu)").set_value(4.55)
     send().click().run()
     assert not at.error, [e.value for e in at.error]
@@ -118,12 +118,13 @@ def test_farmer_makes_offer(app_db):
     goto(at, "Make an Offer")
     at.session_state["ctype_open_0"] = "BASIS"
     at.run()
-    assert num("Futures price ($/bu)").disabled and not num("Basis (¢)").disabled
+    assert num("Futures price ($/bu)").disabled and num("Flat price ($/bu)").disabled and not num("Basis (¢)").disabled
     num("Basis (¢)").set_value(-30)
     send().click().run()
     assert not at.error, [e.value for e in at.error]
     assert {x["contract_type"] for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 1))} == {"FUTURES_ONLY", "BASIS"}
-    # Against a posted bid the symbol, basis and delivery window come from the bid; Cash = futures price + basis.
+    # Against a posted bid the symbol, basis and delivery window come from the bid; Cash is just the flat price and the futures
+    # level to hedge is backed out of the posted basis.
     data.publish_bid(app_db, "rcm", 2, grain="Corn", delivery_month="2999-12", futures_symbol="ZCZ26", location_id=1,
                      basis_cents=-30, cash_price=4.2)
     at = _as(app_db, 1)
@@ -132,15 +133,18 @@ def test_farmer_makes_offer(app_db):
     at.session_state["offer_bid"] = bid_id                                                           # pick the bid (AppTest cannot drive a
     at.run()                                                                                         # selectbox that has a format_func)
     assert not at.exception, at.exception
-    assert num("Basis (¢)").value == -30                                                            # prefilled from the bid
-    num("Futures price ($/bu)").set_value(4.60)
+    assert num("Basis (¢)").value == -30 and num("Basis (¢)").disabled                              # the bid's posted basis, shown not editable
+    assert num("Futures price ($/bu)").disabled and not num("Flat price ($/bu)").disabled
+    num("Flat price ($/bu)").set_value(4.30)
     at.run()
-    assert any("Flat price: $4.3000/bu" in c.value for c in at.caption)                              # 4.60 - 0.30, shown live
+    assert num("Futures price ($/bu)").value == 4.6                                                  # 4.30 + .30, backed out live
+    assert any("Futures level to hedge: $4.6000" in c.value for c in at.caption)
     send().click().run()
     assert not at.error, [e.value for e in at.error]
     offer = [x for x in data.list_offers(app_db, "rcm", conftest.user(app_db, 1)) if x["contract_type"] == "CASH"][0]
-    assert (offer["futures_symbol"], offer["basis_cents"], offer["price"], offer["status"]) == ("ZCZ26", -30, 4.3, "submitted")
-    assert offer["implied_futures"] == 4.6 and str(data.offer_delivery_end(offer)) == "2999-12-31"
+    assert (offer["futures_symbol"], offer["basis_cents"], offer["price"], offer["status"]) == ("ZCZ26", None, 4.3, "submitted")
+    assert offer["implied_futures"] == 4.6 and offer["basis_ref_cents"] == -30
+    assert str(data.offer_delivery_end(offer)) == "2999-12-31"
 
 
 def test_farmer_view_is_read_only_board(app_db):

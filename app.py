@@ -522,8 +522,6 @@ def _terms(o: dict) -> str:
         px = f"{o['basis_cents']:+d}¢ basis on {o['futures_symbol']}"
     elif ct == "FUTURES_ONLY":
         px = f"futures ${o['price']:.4f} on {o['futures_symbol']}"
-    elif o.get("basis_cents") is not None and o.get("implied_futures") is not None:       # cash with its own split
-        px = f"${o['price']:.2f}/bu (futures {o['implied_futures']:.4f} {o['basis_cents']:+d}¢ basis)"
     else:
         px = f"${o['price']:.2f}/bu"
     return f"{o['bushels']:,} bu {o['grain']} · {CONTRACT_LABELS.get(ct, ct)} · {px}"
@@ -537,9 +535,10 @@ def _expiry(d: date | None):
 def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) -> None:
     """farmer_id=None: a farmer submits their own offer. Otherwise staff place it for that farmer.
 
-    The contract type drives the form: Cash takes a futures price and a basis (the flat price is their sum), Futures Only (HTA)
-    only a futures price (the basis is greyed out), Basis Only only a basis (the futures price is greyed out). An offer names a
-    futures month, not a delivery window."""
+    The contract type drives the form: Cash takes only the flat price (the futures price and the basis are greyed out: the basis is
+    the elevator's posted one and the futures price is backed out of it, the level to hedge), Futures Only (HTA) takes only a
+    futures price (the basis is greyed out), Basis Only takes only a basis (the flat and futures prices are greyed out). An offer
+    names a futures month, not a delivery window."""
     tid = tenant["tenant_id"]
     kp = f"f{farmer_id}_" if farmer_id else ""
     locs = _loc_names(db, tid)
@@ -578,15 +577,31 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
     bushels = c2.number_input("Bushels", min_value=0, step=1000, value=5000, format="%d", key=f"{kp}bu_{k}")
     quote = data._quotes_by_symbol(db).get(fut) if _may_see_futures(tenant, user) else None
     live_fut = round(float(quote["price"]), 4) if quote and data._quote_fresh(quote) else None
-    c3, c4 = st.columns(2)
-    futures_price = c3.number_input("Futures price ($/bu)", value=live_fut, step=0.01, format="%.4f",
-                                    disabled=contract == "BASIS", key=f"{kp}fp_{k}_{contract}",
-                                    help="Greyed out for Basis Only: the futures price is set later.")
-    basis = c4.number_input("Basis (¢)", value=bid["basis_cents"] if bid else None, step=1, format="%d",
-                            disabled=contract == "FUTURES_ONLY", key=f"{kp}bs_{k}_{contract}",
-                            help="Greyed out for Futures Only (HTA): the basis is set later.")
-    if contract == "CASH" and futures_price is not None and basis is not None:
-        st.caption(f"Flat price: ${futures_price + basis / 100:.4f}/bu (futures price plus basis).")
+    # The elevator's posted basis for this month (the bid being offered against, else the one bid for this futures month): a
+    # Cash offer's futures level is backed out of it.
+    ref = bid or data._reference_bid(dict(grain=grain, futures_symbol=fut, location_id=None,
+                                          delivery_start=f"{contracts.calendar_month(fut)}-01"), bids)
+    ref_basis = ref["basis_cents"] if ref else None
+    c3, c4, c5 = st.columns(3)
+    flat_default = (ref.get("flat_price") if ref and ref.get("flat_price") is not None else ref.get("cash_price")) if ref else None
+    flat_price = c3.number_input("Flat price ($/bu)", value=flat_default, step=0.01, format="%.4f",
+                                 disabled=contract != "CASH", key=f"{kp}flat_{k}_{contract}",
+                                 help="Cash offers are made at a flat price. Greyed out for the other contract types.")
+    backed_out = round(flat_price - ref_basis / 100.0, 4) if (contract == "CASH" and flat_price is not None
+                                                              and ref_basis is not None) else None
+    futures_price = c4.number_input("Futures price ($/bu)", value=backed_out if contract == "CASH" else live_fut, step=0.01,
+                                    format="%.4f", disabled=contract != "FUTURES_ONLY",
+                                    key=f"{kp}fp_{k}_{contract}_{backed_out}",
+                                    help="Cash: backed out of the flat price and the posted basis (the level to hedge). "
+                                         "Futures Only (HTA): the price you want. Greyed out otherwise.")
+    basis = c5.number_input("Basis (¢)", value=ref_basis if contract in ("CASH", "BASIS") else None, step=1, format="%d",
+                            disabled=contract != "BASIS", key=f"{kp}bs_{k}_{contract}_{ref_basis}",
+                            help="Cash: the elevator's posted basis. Basis Only: the basis you want. Greyed out for Futures Only (HTA).")
+    if contract == "CASH":
+        st.caption(f"Futures level to hedge: ${backed_out:.4f} (flat price {flat_price:.4f} less the posted basis {ref_basis:+d}¢). "
+                   f"It moves if the posted basis moves." if backed_out is not None else
+                   "The futures price is backed out of the flat price and the elevator's posted basis. It shows here once "
+                   "a basis is posted for this month.")
     if bid and bid.get("window_start") and bid.get("window_end"):
         st.caption(f"Delivery: {bid['window_start']:%b %d} – {bid['window_end']:%b %d, %Y}, from the bid. "
                    f"The offer is good through the last day.")
@@ -602,16 +617,16 @@ def offer_form_view(db, tenant: dict, user: dict, farmer_id: int | None = None) 
         if user.get("_preview") and user["role"] == "farmer":
             st.warning("You are previewing as a farmer: offers can't be sent from here.")
             return
-        need = {"CASH": futures_price is not None and basis is not None, "FUTURES_ONLY": futures_price is not None,
-                "BASIS": basis is not None}[contract]
+        need = {"CASH": flat_price is not None, "FUTURES_ONLY": futures_price is not None, "BASIS": basis is not None}[contract]
         if not need:
-            st.error({"CASH": "A cash offer needs a futures price and a basis.", "FUTURES_ONLY": "Enter the futures price.",
+            st.error({"CASH": "Enter the flat price.", "FUTURES_ONLY": "Enter the futures price.",
                       "BASIS": "Enter the basis."}[contract])
             return
         terms = dict(
             grain=grain, contract_type=contract, bushels=int(bushels),
-            futures_price=futures_price if contract != "BASIS" else None,
-            basis_cents=int(basis) if contract != "FUTURES_ONLY" else None,
+            price=flat_price if contract == "CASH" else None,
+            futures_price=futures_price if contract == "FUTURES_ONLY" else None,
+            basis_cents=int(basis) if contract == "BASIS" else None,
             futures_symbol=fut, bid_id=bid["bid_id"] if bid else None,
             location_id=bid["location_id"] if bid else None,
             note=note or None, contract_ref=contract_ref or None, expires_at=_expiry(good))

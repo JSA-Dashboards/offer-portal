@@ -35,16 +35,16 @@ def test_staff_adds_farmer_then_places_offer_for_them(app_db):
     at.session_state[f"f{got['farmer_id']}_offer_bid"] = data.list_bids(app_db, "rcm")[0]["bid_id"]
     at.run()
     assert not at.exception, at.exception
-    next(n for n in at.number_input if n.label == "Futures price ($/bu)").set_value(4.60)
+    next(n for n in at.number_input if n.label == "Flat price ($/bu)").set_value(4.30)
     next(t for t in at.text_input if t.label == "Contract reference # (optional)").set_value("HTA-118")
     next(t for t in at.text_area if t.label == "Notes").set_value("Deliver to the north bin")
     next(b for b in at.button if b.label == "Enter offer").click().run()
     assert not at.exception, at.exception
     assert not at.error, [e.value for e in at.error]
     o = data.list_offers(app_db, "rcm", conftest.user(app_db, 2))[0]
-    assert (o["farmer_name"], o["placed_by"], o["status"], o["basis_cents"], o["contract_ref"], o["note"]) == \
-        ("Farmer Bros LLC (Pat Farmer)", 2, "submitted", -30, "HTA-118", "Deliver to the north bin")
-    assert (o["contract_type"], o["price"], o["implied_futures"]) == ("CASH", 4.3, 4.6)                  # futures 4.60 + basis -30c
+    assert (o["farmer_name"], o["placed_by"], o["status"], o["contract_ref"], o["note"]) == \
+        ("Farmer Bros LLC (Pat Farmer)", 2, "submitted", "HTA-118", "Deliver to the north bin")
+    assert (o["contract_type"], o["price"], o["implied_futures"], o["basis_ref_cents"]) == ("CASH", 4.3, 4.6, -30)   # 4.30 + .30 backed out
     assert str(data.offer_delivery_end(o)) == "2999-12-31"                                              # the bid's window
 
 

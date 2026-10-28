@@ -210,7 +210,7 @@ def test_the_offer_form_needs_its_prices_not_a_delivery_window(app_db):
     at = _as(app_db, 1)
     goto(at, "Make an Offer")
     next(b for b in at.button if b.label == "Send offer").click().run()
-    assert at.error and "futures price and a basis" in at.error[0].value      # Cash is the default contract type
+    assert at.error and "Enter the flat price" in at.error[0].value           # Cash is the default contract type
     assert data.list_offers(app_db, "rcm", user(app_db, 1)) == []
 
 
