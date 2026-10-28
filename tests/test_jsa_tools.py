@@ -70,7 +70,7 @@ def test_view_as_each_level(app_db):
     lens = next(r for r in at.radio if r.label == "View as")
     views = pages
     lens.set_value("Elevator staff").run()
-    assert not at.exception and "Hedge" not in views(at) and "Platform" not in views(at) and "Offers" in views(at)
+    assert not at.exception and "Hedge" not in views(at) and "Platform" not in views(at) and "Working Offers" in views(at)
     assert any("Previewing as elevator staff" in w.value for w in at.warning)
     next(r for r in at.radio if r.label == "View as").set_value("Elevator admin").run()
     assert "Hedge" in views(at) and "Platform" not in views(at)

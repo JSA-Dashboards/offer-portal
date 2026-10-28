@@ -16,8 +16,9 @@ manages its own bids, farmers and offers. One Streamlit app serves every tenant 
   end of its start month). Scraped bids need a clear delivery range; when the source doesn't give one, staff must enter it before approving.
 - **Summary:** offers by commodity and delivery period, filterable by entity, individual, commodity, period.
 - **Confirm Purchase:** the elevator takes the grain on: the offer is added to that day's purchases (and so the recap and the
-  summary), the contract number is recorded and the offer completes. Futures-only offers have no bid to reach, so staff
-  press **Mark Filled** on them. An offer cancelled after it was filled voids its purchase, emails admins to adjust the hedge
+  summary), the contract number is recorded and the offer completes. A futures-only offer is a price on the futures
+  month itself (no basis, no bid): once accepted it fills when the delayed futures quote reaches it, then acts like any other
+  offer. Accepting an offer emails the farmer ("we are working it"); **Mark Filled** is the manual fallback. An offer cancelled after it was filled voids its purchase, emails admins to adjust the hedge
   and sits on the Hedge page until they confirm.
 - **Email:** an outbox (`portal/notify.py`) emails farmers, staff and admins on offer events (the app flushes it after an
   action; `notify_run.py` on the droplet covers the rest). Everyone can switch their own notifications off.

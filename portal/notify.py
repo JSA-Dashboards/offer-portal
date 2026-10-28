@@ -7,6 +7,7 @@ caller wraps `offer_event` in a try/except.
 
 Who hears about what:
   offer_submitted  staff + admins (not the person who entered it)      "New offer"
+  offer_working    the farmer                                          "accepted: we are working it"
   offer_hit        the farmer, staff, admins                           "confirm the purchase, then enter the contract #"
   offer_completed  the farmer                                          contract number
   offer_declined / offer_expired   the farmer
@@ -147,6 +148,11 @@ def offer_event(db: Db, tenant_id: str, kind: str, offer_id: int, **ctx) -> int:
         if farmer:
             plan.append(([farmer], f"Your offer was hit: {o['bushels']:,} bu {o['grain']}",
                          _msg(tenant, "Good news: your offer was hit. The elevator will confirm your contract shortly.", o)))
+    elif kind == "offer_working":
+        if farmer:
+            plan.append(([farmer], f"Your offer was accepted: {o['bushels']:,} bu {o['grain']}",
+                         _msg(tenant, "<b>The elevator has accepted your offer</b> and is working it. It fills "
+                                      "automatically when the market reaches your price, and you will hear from us then.", o)))
     elif kind == "offer_completed":
         if farmer:
             plan.append(([farmer], f"Contract confirmed: {o['bushels']:,} bu {o['grain']} (#{o.get('contract_ref') or ''})",

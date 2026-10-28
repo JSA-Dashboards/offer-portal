@@ -1547,7 +1547,7 @@ def main() -> None:
     tid = tenant["tenant_id"]
     admin = user["role"] in ("elevator_admin", "platform_admin")
     seasonals = ["Grain Futures Seasonals"] if _may_see_futures(tenant, user) else []
-    views = (["Offers", "Place Offer", "Summary"] + (["Hedge"] if admin else []) +
+    views = (["Working Offers", "Place Offer", "Summary"] + (["Hedge"] if admin else []) +
              ["Purchases", "Recap", "Bid Board"] + seasonals + ["USDA Calendar"] +
              (["Review Scraped Bids"] if admin else []) + ["Farmers", "People"] if staff
              else ["Bid Board", "Make an Offer", "My Offers"] + seasonals + ["USDA Calendar"])

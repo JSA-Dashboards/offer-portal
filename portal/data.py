@@ -480,6 +480,20 @@ def _reprice_flat_offers(db: Db, tenant_id: str, bid: dict, old_ids: list, actor
     return n
 
 
+def _quotes_by_symbol(db: Db) -> dict[str, dict]:
+    return {q["symbol"]: q for q in db.query("SELECT symbol, price, as_of, fetched_at FROM futures_quotes")}
+
+
+def futures_reached(offer: dict, quote: dict | None) -> bool:
+    """A FUTURES-ONLY offer is a price on the futures month itself (no basis, no bid): it is reached when the fresh delayed
+    quote for that month is at or above the offered price. A stale or missing quote reaches nothing."""
+    if offer["contract_type"] != "FUTURES_ONLY" or offer["status"] not in ("submitted", "working"):
+        return False
+    if not quote or quote.get("price") is None or offer.get("price") is None or not _quote_fresh(quote):
+        return False
+    return float(quote["price"]) >= float(offer["price"])
+
+
 def bid_reached(offer: dict, bid: dict | None) -> bool:
     """Has the live bid come up to this outstanding offer? (A prompt for staff to accept it.)"""
     if bid is None or offer["status"] not in ("submitted", "working"):
@@ -640,9 +654,16 @@ def list_offers(db: Db, tenant_id: str, user: dict, status: str | None = None) -
         params.append(status)
     rows = db.query(sql + " ORDER BY o.created_at DESC", tuple(params))
     bids = list_bids(db, tenant_id)
+    quotes = _quotes_by_symbol(db) if any(o["contract_type"] == "FUTURES_ONLY" and o["status"] in ("submitted", "working")
+                                          for o in rows) else {}
     for o in rows:
         o["delivery_period"] = delivery_period(o)
-        o["bid_reached"] = bid_reached(o, _reference_bid(o, bids)) if o["status"] in ("submitted", "working") else False
+        if o["status"] not in ("submitted", "working"):
+            o["bid_reached"] = False
+        elif o["contract_type"] == "FUTURES_ONLY":
+            o["bid_reached"] = futures_reached(o, quotes.get(o.get("futures_symbol")))     # the futures price, not a bid
+        else:
+            o["bid_reached"] = bid_reached(o, _reference_bid(o, bids))
     return rows
 
 
@@ -708,20 +729,28 @@ def _hit_context(bid: dict | None) -> dict:
 
 
 def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, auto: bool = False,
-              bid: dict | None = None) -> None:
+              bid: dict | None = None, quote: dict | None = None) -> None:
     """The one place an offer becomes hit (Filled): the bid reaching a working offer (auto, actor None) or staff marking it
     filled. Writes the status, the history event, the confirmation, and the billing usage. Either way the live price
     context at the moment of the hit is saved with the event and the confirmation."""
     cur = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
-    if bid is None:                                      # a manual fill: look up the bid that prices this offer
-        bid = _reference_bid(cur, list_bids(db, tenant_id))
-    ctx = _hit_context(bid)
+    if cur["contract_type"] == "FUTURES_ONLY":           # priced on the futures month itself: keep that quote
+        q = (quote if quote is not None else _quotes_by_symbol(db).get(cur.get("futures_symbol"))) or {}
+        ctx = dict(futures_quote=q.get("price"), quote_as_of=q.get("as_of") or q.get("fetched_at"), flat_source="futures",
+                   futures_only=True)
+        bid = None
+    else:
+        if bid is None:                                  # a manual fill: look up the bid that prices this offer
+            bid = _reference_bid(cur, list_bids(db, tenant_id))
+        ctx = _hit_context(bid)
     db.execute("UPDATE offers SET status = 'hit', hit_at = CURRENT_TIMESTAMP(), hit_by = %s, auto_hit = %s, "
                "updated_at = CURRENT_TIMESTAMP() "
                "WHERE offer_id = %s AND tenant_id = %s AND status IN ('submitted', 'working')",
                (actor_id, auto, offer_id, tenant_id))
     detail = {"on_behalf": False, "hit_context": ctx}
-    if auto and bid:
+    if auto and not bid:                                 # a futures-only offer reached on the futures quote
+        detail.update(auto_hit=True, **{k: v for k, v in ctx.items() if k != "quote_as_of"})
+    elif auto and bid:
         detail.update(auto_hit=True, bid_id=bid["bid_id"],
                       bid_basis_cents=bid["basis_cents"], bid_cash_price=bid["cash_price"],
                       bid_flat_price=bid.get("flat_price"), flat_source=bid.get("flat_source"),
@@ -736,11 +765,17 @@ def _mark_hit(db: Db, tenant_id: str, offer_id: int, *, actor_id=None, auto: boo
 
 
 # ── Filling working offers ─────────────────────────────────────────────────────
-def _fill_if_reached(db: Db, tenant_id: str, offer: dict, bids: list[dict]) -> bool:
-    """Fill this offer if it is WORKING (accepted) and the live bid has reached it. Futures-only offers have no bid to
-    reach, so staff fill those by hand."""
-    if offer["status"] != "working" or offer["contract_type"] == "FUTURES_ONLY":
+def _fill_if_reached(db: Db, tenant_id: str, offer: dict, bids: list[dict], quotes: dict | None = None) -> bool:
+    """Fill this offer if it is WORKING (accepted) and its price has been reached: the live flat bid for cash and HTA
+    offers, the delayed futures quote itself for futures-only offers (a straight futures price, no basis)."""
+    if offer["status"] != "working":
         return False
+    if offer["contract_type"] == "FUTURES_ONLY":
+        q = (quotes if quotes is not None else _quotes_by_symbol(db)).get(offer.get("futures_symbol"))
+        if not futures_reached(offer, q):
+            return False
+        _mark_hit(db, tenant_id, offer["offer_id"], auto=True, quote=q)
+        return True
     bid = _reference_bid(offer, bids)
     if not bid_reached(offer, bid):
         return False
@@ -755,8 +790,8 @@ def run_auto_hit(db: Db, tenant_id: str) -> int:
     rows = db.query("SELECT * FROM offers WHERE tenant_id = %s AND status = 'working'", (tenant_id,))
     if not rows:
         return 0
-    bids = list_bids(db, tenant_id)
-    return sum(_fill_if_reached(db, tenant_id, o, bids) for o in rows)
+    bids, quotes = list_bids(db, tenant_id), _quotes_by_symbol(db)
+    return sum(_fill_if_reached(db, tenant_id, o, bids, quotes) for o in rows)
 
 
 def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
@@ -797,11 +832,11 @@ def act_on_offer(db: Db, tenant_id: str, user: dict, offer_id: int, action: str,
     _insert(db, "offer_events", dict(tenant_id=tenant_id, offer_id=offer_id, actor_user_id=user["user_id"],
                                      event_type="accepted" if new_status == "working" else new_status,
                                      detail={"on_behalf": on_behalf}), ("detail",))
-    _notify(db, tenant_id, "offer_" + new_status, offer_id, on_behalf=on_behalf)
     if new_status == "working":                                       # already at its price? it fills now
         o = db.query("SELECT * FROM offers WHERE offer_id = %s AND tenant_id = %s", (offer_id, tenant_id))[0]
         if _fill_if_reached(db, tenant_id, o, list_bids(db, tenant_id)):
-            return "hit"
+            return "hit"                                              # the farmer hears "hit"; no separate "accepted" email
+    _notify(db, tenant_id, "offer_" + new_status, offer_id, on_behalf=on_behalf)
     return new_status
 
 

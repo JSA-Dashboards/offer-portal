@@ -27,7 +27,7 @@ def _hit_offer(db):
 def test_navigation_by_role(app_db):
     admin = _views(_as(app_db, 2))                                                         # elevator admin
     assert [v for v in admin if v != "Hedge"] == [
-        "Offers", "Place Offer", "Summary", "Purchases", "Recap", "Bid Board", "Grain Futures Seasonals", "USDA Calendar",
+        "Working Offers", "Place Offer", "Summary", "Purchases", "Recap", "Bid Board", "Grain Futures Seasonals", "USDA Calendar",
         "Review Scraped Bids", "Farmers", "People"]                                        # the order Kolten set, in Title Case
     assert admin[3] == "Hedge"                                                             # the admin-only page follows Summary
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
@@ -216,7 +216,7 @@ def test_each_role_sees_its_own_set_of_pages(app_db):
     app_db.execute("INSERT INTO users (user_id, tenant_id, email, role) VALUES (20, 'rcm', 's@rcm.com', 'elevator_staff')")
     farmer, staff, admin = (set(_views(_as(app_db, u))) for u in (1, 20, 2))
     assert farmer == {"Bid Board", "Make an Offer", "My Offers", "USDA Calendar"}
-    assert {"Offers", "Purchases", "Place Offer", "Bid Board", "USDA Calendar"} <= staff
+    assert {"Working Offers", "Purchases", "Place Offer", "Bid Board", "USDA Calendar"} <= staff
     assert not staff & {"Hedge", "Review Scraped Bids"}            # admin only
     assert staff < admin and {"Hedge", "Review Scraped Bids"} <= admin
     assert "Auto-Hit" not in admin                                            # offers fill by themselves now: no rules page

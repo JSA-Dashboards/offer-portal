@@ -78,8 +78,8 @@ def test_a_working_offer_can_be_withdrawn_or_declined_and_futures_only_offers_ne
     a, b = _offer(db), _offer(db)
     data.act_on_offer(db, "rcm", user(db, 2), a, "accept")                            # fills at once...
     futs = data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "contract_type": "FUTURES_ONLY", "price": 4.55}, bid_id=_bid_id(db))
-    assert data.act_on_offer(db, "rcm", user(db, 2), futs, "accept") == "working"     # ...a futures-only one has no bid to reach
-    assert data.run_auto_hit(db, "rcm") == 0 and _status(db, futs) == "working"
+    assert data.act_on_offer(db, "rcm", user(db, 2), futs, "accept") == "working"     # ...a futures-only one waits for a futures quote
+    assert data.run_auto_hit(db, "rcm") == 0 and _status(db, futs) == "working"        # (none yet)
     assert data.act_on_offer(db, "rcm", user(db, 1), futs, "withdraw") == "withdrawn"
     data.act_on_offer(db, "rcm", user(db, 2), b, "accept")
     assert _status(db, b) == "hit"
@@ -152,3 +152,82 @@ def test_ct_date_reads_utc_text_and_datetimes_in_central_time():
     assert str(data.ct_date("2026-10-26 02:30:00")) == "2026-10-25"                        # 9:30 pm Central the day before
     assert str(data.ct_date(datetime(2026, 10, 26, 15, 0, tzinfo=timezone.utc))) == "2026-10-26"
     assert data.ct_date(None) is None and data.ct_date("") is None
+
+
+# ── a futures-only offer is a price on the futures month itself ──────────────
+def _quote(price, minutes_old=0):
+    return {"price": price, "as_of": datetime.now(timezone.utc) - timedelta(minutes=minutes_old)}
+
+
+def _futures_only(db, price=4.55):
+    return data.create_offer(db, "rcm", user(db, 1), **{**FLAT, "contract_type": "FUTURES_ONLY", "price": price},
+                             bid_id=_bid_id(db))
+
+
+def test_a_working_futures_only_offer_fills_when_the_futures_quote_reaches_its_price(db):
+    _bid(db)
+    futures.update_quotes(db, {"ZCZ26": _quote(4.40)})
+    oid = _futures_only(db, 4.55)
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "working"        # 4.40 < 4.55
+    assert data.run_auto_hit(db, "rcm") == 0
+    out = futures.run_update(db, fetch=lambda syms: {"ZCZ26": _quote(4.60)})            # the next delayed quote
+    assert out["tenants"]["rcm"] == {"auto_hit": 1} and _status(db, oid) == "hit"
+    o = [x for x in data.list_offers(db, "rcm", user(db, 2)) if x["offer_id"] == oid][0]
+    assert o["auto_hit"] and o["hit_by"] is None
+    ev = db.query("SELECT detail FROM offer_events WHERE offer_id = %s AND event_type = 'hit'", (oid,))[0]["detail"]
+    assert '"futures_quote": 4.6' in ev and '"futures_only": true' in ev                  # the quote that reached it is kept
+    data.confirm_purchase(db, "rcm", 2, oid, "C-55")                                      # then it acts like any other offer
+    assert _status(db, oid) == "completed"
+
+
+def test_a_futures_only_price_ignores_the_basis_and_the_bid(db):
+    _bid(db, cash=3.00, basis=-120)                                                       # a terrible bid and basis
+    futures.update_quotes(db, {"ZCZ26": _quote(4.70)})
+    oid = _futures_only(db, 4.55)
+    o = [x for x in data.list_offers(db, "rcm", user(db, 2)) if x["offer_id"] == oid][0]
+    assert o["bid_reached"] is True                                                       # highlighted while outstanding
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "hit"              # accepting at a reached price fills it
+
+
+def test_a_stale_or_missing_futures_quote_fills_nothing_and_mark_filled_still_works(db):
+    _bid(db)
+    oid = _futures_only(db, 4.55)
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "accept") == "working"          # no quote at all
+    futures.update_quotes(db, {"ZCZ26": _quote(9.99)})
+    old = (datetime.now(timezone.utc) - timedelta(minutes=data.QUOTE_MAX_AGE_MIN + 10)).strftime("%Y-%m-%d %H:%M:%S")
+    db.execute("UPDATE futures_quotes SET fetched_at = %s", (old,))                       # the feed has stopped
+    assert data.run_auto_hit(db, "rcm") == 0 and _status(db, oid) == "working"            # a dead feed prices nothing
+    assert data.act_on_offer(db, "rcm", user(db, 2), oid, "hit") == "hit"                 # staff can still fill it by hand
+    ev = db.query("SELECT detail FROM offer_events WHERE offer_id = %s AND event_type = 'hit'", (oid,))[0]["detail"]
+    assert '"futures_only": true' in ev
+
+
+# ── the farmer is emailed when the offer is accepted ─────────────────────────
+def _farmer_mail(db, kind):
+    return db.query("SELECT to_email, subject, body_html FROM notifications WHERE kind = %s ORDER BY notification_id", (kind,))
+
+
+def test_accepting_an_offer_emails_the_farmer_once_and_only_the_farmer(db):
+    _bid(db, cash=4.18)
+    oid = _offer(db)
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "accept")
+    mail = _farmer_mail(db, "offer_working")
+    assert [m["to_email"] for m in mail] == ["farmer@a.com"]
+    assert mail[0]["subject"].startswith("Your offer was accepted: 5,000 bu Corn") and "working it" in mail[0]["body_html"]
+    assert "substantial risk of loss" in mail[0]["body_html"]                              # the standard disclaimer, as in every email
+
+
+def test_an_offer_accepted_at_a_reached_price_sends_the_hit_email_not_two_emails(db):
+    _bid(db, cash=4.50)
+    oid = _offer(db)
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "accept")
+    assert _farmer_mail(db, "offer_working") == []
+    assert [m["to_email"] for m in _farmer_mail(db, "offer_hit") if m["to_email"] == "farmer@a.com"] == ["farmer@a.com"]
+
+
+def test_a_farmer_who_turned_notifications_off_is_not_emailed_on_accept(db):
+    db.execute("UPDATE users SET notify_email = 0 WHERE user_id = 1")
+    _bid(db)
+    oid = _offer(db)
+    data.act_on_offer(db, "rcm", user(db, 2), oid, "accept")
+    assert _farmer_mail(db, "offer_working") == []
